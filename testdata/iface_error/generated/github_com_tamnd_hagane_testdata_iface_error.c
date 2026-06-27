@@ -151,8 +151,8 @@ blk5:;
     hg_github_com_tamnd_hagane_testdata_iface_error_MyError_t _local_t34; memset(&_local_t34, 0, sizeof(hg_github_com_tamnd_hagane_testdata_iface_error_MyError_t));
     hg_github_com_tamnd_hagane_testdata_iface_error_MyError_t* t34 = &_local_t34;
     _hg_ta_hg_github_com_tamnd_hagane_testdata_iface_error_MyError_t_t t35; {
-        t35.r1 = (((const hg_iface_tab_t*)t33.itab)->type == &hg_type_hg_github_com_tamnd_hagane_testdata_iface_error_MyError);
-        if (t35.r1) t35.r0 = *(hg_github_com_tamnd_hagane_testdata_iface_error_MyError_t*)t33.data; else memset(&t35.r0, 0, sizeof(t35.r0));
+        t35.r1 = ((t33).itab && ((const hg_iface_tab_t*)t33.itab)->type == &hg_type_hg_github_com_tamnd_hagane_testdata_iface_error_MyError);
+        if (t35.r1) t35.r0 = *(hg_github_com_tamnd_hagane_testdata_iface_error_MyError_t*)(t33).data; else memset(&t35.r0, 0, sizeof(t35.r0));
     }
     hg_github_com_tamnd_hagane_testdata_iface_error_MyError_t t36 = t35.r0;
     hg_nil_check(t34, "/Users/apple/github/tamnd/hagane/testdata/iface_error/main.go:38", 0);

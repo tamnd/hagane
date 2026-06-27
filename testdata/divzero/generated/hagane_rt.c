@@ -272,6 +272,11 @@ void hg_fmt_printf(hg_string_t fmt_str, hg_slice_hg_iface_t_t args) {
                 printf("%.*s", (int)s.len, s.ptr ? s.ptr : "");
             } else hg_iface_print(a); break;
         case 'v': hg_iface_print(a); break;
+        case 'T': {
+            const char *tname = tab ? tab->type->name : NULL;
+            printf("%s", tname ? tname : "<nil>");
+            break;
+        }
         case 't':
             if (kind == HG_KIND_BOOL) printf("%s", *(bool*)a.data ? "true" : "false");
             else hg_iface_print(a); break;
@@ -448,6 +453,12 @@ hg_string_t hg_fmt_sprintf(hg_string_t fmt_str, hg_slice_hg_iface_t_t args) {
             } else hg_iface_sbuf(&b, a);
             break;
         case 'v': hg_iface_sbuf(&b, a); break;
+        case 'T': {
+            const char *tname = tab ? tab->type->name : NULL;
+            if (tname) hg_sbuf_writes(&b, tname, strlen(tname));
+            else hg_sbuf_writes(&b, "<nil>", 5);
+            break;
+        }
         case 'f': case 'e': case 'E': case 'g': case 'G':
             if (kind == HG_KIND_FLOAT64) hg_sbuf_printf(&b, cfmt, *(double*)a.data);
             else if (kind == HG_KIND_FLOAT32) hg_sbuf_printf(&b, cfmt, (double)*(float*)a.data);

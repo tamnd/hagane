@@ -13,8 +13,8 @@ typedef struct {
 void hg_github_com_tamnd_hagane_testdata_iface_basic_greet(hg_github_com_tamnd_hagane_testdata_iface_basic_Greeter_t g);
 void hg_github_com_tamnd_hagane_testdata_iface_basic_init(void);
 void hg_github_com_tamnd_hagane_testdata_iface_basic_main(void);
-hg_string_t hg_github_com_tamnd_hagane_testdata_iface_basic_English_Greet(hg_github_com_tamnd_hagane_testdata_iface_basic_English_t e);
 hg_string_t hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish_Greet(hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish_t s);
+hg_string_t hg_github_com_tamnd_hagane_testdata_iface_basic_English_Greet(hg_github_com_tamnd_hagane_testdata_iface_basic_English_t e);
 typedef struct { hg_iface_t elems[1]; } hg_array_hg_iface_t_1_t;
 typedef struct { hg_github_com_tamnd_hagane_testdata_iface_basic_English_t r0; bool r1; } _hg_ta_hg_github_com_tamnd_hagane_testdata_iface_basic_English_t_t;
 typedef struct { hg_iface_t elems[2]; } hg_array_hg_iface_t_2_t;
@@ -28,20 +28,6 @@ static hg_string_t hg_itab_github_com_tamnd_hagane_testdata_iface_basic_Greeter_
 static void* hg_itab_github_com_tamnd_hagane_testdata_iface_basic_Greeter_github_com_tamnd_hagane_testdata_iface_basic_Spanish_methods[] = {(void*)hg_itab_github_com_tamnd_hagane_testdata_iface_basic_Greeter_github_com_tamnd_hagane_testdata_iface_basic_Spanish_w0};
 static const hg_iface_tab_t hg_itab_github_com_tamnd_hagane_testdata_iface_basic_Greeter_github_com_tamnd_hagane_testdata_iface_basic_Spanish = {&hg_type_hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish, hg_itab_github_com_tamnd_hagane_testdata_iface_basic_Greeter_github_com_tamnd_hagane_testdata_iface_basic_Spanish_methods};
 
-hg_string_t hg_github_com_tamnd_hagane_testdata_iface_basic_English_Greet(hg_github_com_tamnd_hagane_testdata_iface_basic_English_t e) {
-    goto blk0;
-blk0:;
-    hg_github_com_tamnd_hagane_testdata_iface_basic_English_t _local_t0; memset(&_local_t0, 0, sizeof(hg_github_com_tamnd_hagane_testdata_iface_basic_English_t));
-    hg_github_com_tamnd_hagane_testdata_iface_basic_English_t* t0 = &_local_t0;
-    hg_nil_check(t0, "?", 0);
-    *(t0) = e;
-    hg_string_t* t1 = &(t0)->name;
-    hg_nil_check(t1, "/Users/apple/github/tamnd/hagane/testdata/iface_basic/main.go:12", 0);
-    hg_string_t t2 = *((hg_string_t*)t1);
-    hg_string_t t3 = hg_string_concat(hg_string_lit("Hello, "), t2);
-    return t3;
-}
-
 hg_string_t hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish_Greet(hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish_t s) {
     goto blk0;
 blk0:;
@@ -53,6 +39,20 @@ blk0:;
     hg_nil_check(t1, "/Users/apple/github/tamnd/hagane/testdata/iface_basic/main.go:13", 0);
     hg_string_t t2 = *((hg_string_t*)t1);
     hg_string_t t3 = hg_string_concat(hg_string_lit("Hola, "), t2);
+    return t3;
+}
+
+hg_string_t hg_github_com_tamnd_hagane_testdata_iface_basic_English_Greet(hg_github_com_tamnd_hagane_testdata_iface_basic_English_t e) {
+    goto blk0;
+blk0:;
+    hg_github_com_tamnd_hagane_testdata_iface_basic_English_t _local_t0; memset(&_local_t0, 0, sizeof(hg_github_com_tamnd_hagane_testdata_iface_basic_English_t));
+    hg_github_com_tamnd_hagane_testdata_iface_basic_English_t* t0 = &_local_t0;
+    hg_nil_check(t0, "?", 0);
+    *(t0) = e;
+    hg_string_t* t1 = &(t0)->name;
+    hg_nil_check(t1, "/Users/apple/github/tamnd/hagane/testdata/iface_basic/main.go:12", 0);
+    hg_string_t t2 = *((hg_string_t*)t1);
+    hg_string_t t3 = hg_string_concat(hg_string_lit("Hello, "), t2);
     return t3;
 }
 
@@ -124,8 +124,8 @@ blk0:;
     hg_github_com_tamnd_hagane_testdata_iface_basic_English_t _local_t20; memset(&_local_t20, 0, sizeof(hg_github_com_tamnd_hagane_testdata_iface_basic_English_t));
     hg_github_com_tamnd_hagane_testdata_iface_basic_English_t* t20 = &_local_t20;
     _hg_ta_hg_github_com_tamnd_hagane_testdata_iface_basic_English_t_t t21; {
-        t21.r1 = (((const hg_iface_tab_t*)t13.itab)->type == &hg_type_hg_github_com_tamnd_hagane_testdata_iface_basic_English);
-        if (t21.r1) t21.r0 = *(hg_github_com_tamnd_hagane_testdata_iface_basic_English_t*)t13.data; else memset(&t21.r0, 0, sizeof(t21.r0));
+        t21.r1 = ((t13).itab && ((const hg_iface_tab_t*)t13.itab)->type == &hg_type_hg_github_com_tamnd_hagane_testdata_iface_basic_English);
+        if (t21.r1) t21.r0 = *(hg_github_com_tamnd_hagane_testdata_iface_basic_English_t*)(t13).data; else memset(&t21.r0, 0, sizeof(t21.r0));
     }
     hg_github_com_tamnd_hagane_testdata_iface_basic_English_t t22 = t21.r0;
     hg_nil_check(t20, "/Users/apple/github/tamnd/hagane/testdata/iface_basic/main.go:27", 0);
@@ -150,8 +150,8 @@ blk1:;
     goto blk2;
 blk2:;
     _hg_ta_hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish_t_t t33; {
-        t33.r1 = (((const hg_iface_tab_t*)t13.itab)->type == &hg_type_hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish);
-        if (t33.r1) t33.r0 = *(hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish_t*)t13.data; else memset(&t33.r0, 0, sizeof(t33.r0));
+        t33.r1 = ((t13).itab && ((const hg_iface_tab_t*)t13.itab)->type == &hg_type_hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish);
+        if (t33.r1) t33.r0 = *(hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish_t*)(t13).data; else memset(&t33.r0, 0, sizeof(t33.r0));
     }
     hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish_t t34 = t33.r0;
     bool t35 = t33.r1;
@@ -167,8 +167,8 @@ blk3:;
     goto blk4;
 blk4:;
     _hg_ta_hg_github_com_tamnd_hagane_testdata_iface_basic_English_t_t t41; {
-        t41.r1 = (((const hg_iface_tab_t*)t13.itab)->type == &hg_type_hg_github_com_tamnd_hagane_testdata_iface_basic_English);
-        if (t41.r1) t41.r0 = *(hg_github_com_tamnd_hagane_testdata_iface_basic_English_t*)t13.data; else memset(&t41.r0, 0, sizeof(t41.r0));
+        t41.r1 = ((t13).itab && ((const hg_iface_tab_t*)t13.itab)->type == &hg_type_hg_github_com_tamnd_hagane_testdata_iface_basic_English);
+        if (t41.r1) t41.r0 = *(hg_github_com_tamnd_hagane_testdata_iface_basic_English_t*)(t13).data; else memset(&t41.r0, 0, sizeof(t41.r0));
     }
     hg_github_com_tamnd_hagane_testdata_iface_basic_English_t t42 = t41.r0;
     bool t43 = t41.r1;
@@ -197,8 +197,8 @@ blk6:;
     goto blk5;
 blk7:;
     _hg_ta_hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish_t_t t54; {
-        t54.r1 = (((const hg_iface_tab_t*)t13.itab)->type == &hg_type_hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish);
-        if (t54.r1) t54.r0 = *(hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish_t*)t13.data; else memset(&t54.r0, 0, sizeof(t54.r0));
+        t54.r1 = ((t13).itab && ((const hg_iface_tab_t*)t13.itab)->type == &hg_type_hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish);
+        if (t54.r1) t54.r0 = *(hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish_t*)(t13).data; else memset(&t54.r0, 0, sizeof(t54.r0));
     }
     hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish_t t55 = t54.r0;
     bool t56 = t54.r1;

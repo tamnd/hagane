@@ -16,10 +16,10 @@ void hg_github_com_tamnd_hagane_testdata_iface_multi_main(void);
 void hg_github_com_tamnd_hagane_testdata_iface_multi_printShape(hg_github_com_tamnd_hagane_testdata_iface_multi_Shape_t s);
 double hg_github_com_tamnd_hagane_testdata_iface_multi_Circle_Area(hg_github_com_tamnd_hagane_testdata_iface_multi_Circle_t c);
 double hg_github_com_tamnd_hagane_testdata_iface_multi_Rectangle_Area(hg_github_com_tamnd_hagane_testdata_iface_multi_Rectangle_t r);
-hg_string_t hg_github_com_tamnd_hagane_testdata_iface_multi_Circle_Name(hg_github_com_tamnd_hagane_testdata_iface_multi_Circle_t c);
 hg_string_t hg_github_com_tamnd_hagane_testdata_iface_multi_Rectangle_Name(hg_github_com_tamnd_hagane_testdata_iface_multi_Rectangle_t r);
-double hg_github_com_tamnd_hagane_testdata_iface_multi_Circle_Perimeter(hg_github_com_tamnd_hagane_testdata_iface_multi_Circle_t c);
+hg_string_t hg_github_com_tamnd_hagane_testdata_iface_multi_Circle_Name(hg_github_com_tamnd_hagane_testdata_iface_multi_Circle_t c);
 double hg_github_com_tamnd_hagane_testdata_iface_multi_Rectangle_Perimeter(hg_github_com_tamnd_hagane_testdata_iface_multi_Rectangle_t r);
+double hg_github_com_tamnd_hagane_testdata_iface_multi_Circle_Perimeter(hg_github_com_tamnd_hagane_testdata_iface_multi_Circle_t c);
 typedef struct { hg_iface_t elems[3]; } hg_array_hg_iface_t_3_t;
 typedef struct { hg_github_com_tamnd_hagane_testdata_iface_multi_Rectangle_t r0; bool r1; } _hg_ta_hg_github_com_tamnd_hagane_testdata_iface_multi_Rectangle_t_t;
 typedef struct { hg_iface_t elems[2]; } hg_array_hg_iface_t_2_t;
@@ -73,30 +73,16 @@ blk0:;
     return t5;
 }
 
-hg_string_t hg_github_com_tamnd_hagane_testdata_iface_multi_Circle_Name(hg_github_com_tamnd_hagane_testdata_iface_multi_Circle_t c) {
-    goto blk0;
-blk0:;
-    return hg_string_lit("Circle");
-}
-
 hg_string_t hg_github_com_tamnd_hagane_testdata_iface_multi_Rectangle_Name(hg_github_com_tamnd_hagane_testdata_iface_multi_Rectangle_t r) {
     goto blk0;
 blk0:;
     return hg_string_lit("Rectangle");
 }
 
-double hg_github_com_tamnd_hagane_testdata_iface_multi_Circle_Perimeter(hg_github_com_tamnd_hagane_testdata_iface_multi_Circle_t c) {
+hg_string_t hg_github_com_tamnd_hagane_testdata_iface_multi_Circle_Name(hg_github_com_tamnd_hagane_testdata_iface_multi_Circle_t c) {
     goto blk0;
 blk0:;
-    hg_github_com_tamnd_hagane_testdata_iface_multi_Circle_t _local_t0; memset(&_local_t0, 0, sizeof(hg_github_com_tamnd_hagane_testdata_iface_multi_Circle_t));
-    hg_github_com_tamnd_hagane_testdata_iface_multi_Circle_t* t0 = &_local_t0;
-    hg_nil_check(t0, "?", 0);
-    *(t0) = c;
-    double* t1 = &(t0)->radius;
-    hg_nil_check(t1, "/Users/apple/github/tamnd/hagane/testdata/iface_multi/main.go:24", 0);
-    double t2 = *((double*)t1);
-    double t3 = 6.28318 * t2;
-    return t3;
+    return hg_string_lit("Circle");
 }
 
 double hg_github_com_tamnd_hagane_testdata_iface_multi_Rectangle_Perimeter(hg_github_com_tamnd_hagane_testdata_iface_multi_Rectangle_t r) {
@@ -115,6 +101,20 @@ blk0:;
     double t5 = t2 + t4;
     double t6 = 2 * t5;
     return t6;
+}
+
+double hg_github_com_tamnd_hagane_testdata_iface_multi_Circle_Perimeter(hg_github_com_tamnd_hagane_testdata_iface_multi_Circle_t c) {
+    goto blk0;
+blk0:;
+    hg_github_com_tamnd_hagane_testdata_iface_multi_Circle_t _local_t0; memset(&_local_t0, 0, sizeof(hg_github_com_tamnd_hagane_testdata_iface_multi_Circle_t));
+    hg_github_com_tamnd_hagane_testdata_iface_multi_Circle_t* t0 = &_local_t0;
+    hg_nil_check(t0, "?", 0);
+    *(t0) = c;
+    double* t1 = &(t0)->radius;
+    hg_nil_check(t1, "/Users/apple/github/tamnd/hagane/testdata/iface_multi/main.go:24", 0);
+    double t2 = *((double*)t1);
+    double t3 = 6.28318 * t2;
+    return t3;
 }
 
 void hg_github_com_tamnd_hagane_testdata_iface_multi_init(void) {
@@ -204,8 +204,8 @@ blk5:;
     hg_nil_check(t30, "?", 0);
     hg_github_com_tamnd_hagane_testdata_iface_multi_Shape_t t31 = *((hg_github_com_tamnd_hagane_testdata_iface_multi_Shape_t*)t30);
     _hg_ta_hg_github_com_tamnd_hagane_testdata_iface_multi_Rectangle_t_t t32; {
-        t32.r1 = (((const hg_iface_tab_t*)t31.itab)->type == &hg_type_hg_github_com_tamnd_hagane_testdata_iface_multi_Rectangle);
-        if (t32.r1) t32.r0 = *(hg_github_com_tamnd_hagane_testdata_iface_multi_Rectangle_t*)t31.data; else memset(&t32.r0, 0, sizeof(t32.r0));
+        t32.r1 = ((t31).itab && ((const hg_iface_tab_t*)t31.itab)->type == &hg_type_hg_github_com_tamnd_hagane_testdata_iface_multi_Rectangle);
+        if (t32.r1) t32.r0 = *(hg_github_com_tamnd_hagane_testdata_iface_multi_Rectangle_t*)(t31).data; else memset(&t32.r0, 0, sizeof(t32.r0));
     }
     hg_github_com_tamnd_hagane_testdata_iface_multi_Rectangle_t t33 = t32.r0;
     bool t34 = t32.r1;
@@ -238,8 +238,8 @@ blk7:;
     goto blk4;
 blk8:;
     _hg_ta_hg_github_com_tamnd_hagane_testdata_iface_multi_Circle_t_t t47; {
-        t47.r1 = (((const hg_iface_tab_t*)t31.itab)->type == &hg_type_hg_github_com_tamnd_hagane_testdata_iface_multi_Circle);
-        if (t47.r1) t47.r0 = *(hg_github_com_tamnd_hagane_testdata_iface_multi_Circle_t*)t31.data; else memset(&t47.r0, 0, sizeof(t47.r0));
+        t47.r1 = ((t31).itab && ((const hg_iface_tab_t*)t31.itab)->type == &hg_type_hg_github_com_tamnd_hagane_testdata_iface_multi_Circle);
+        if (t47.r1) t47.r0 = *(hg_github_com_tamnd_hagane_testdata_iface_multi_Circle_t*)(t31).data; else memset(&t47.r0, 0, sizeof(t47.r0));
     }
     hg_github_com_tamnd_hagane_testdata_iface_multi_Circle_t t48 = t47.r0;
     bool t49 = t47.r1;
