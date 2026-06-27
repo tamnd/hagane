@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -148,6 +149,9 @@ func main() { fmt.Println(42) }
 
 	cFiles, _ := filepath.Glob(filepath.Join(outDir, "*.c"))
 	bin := filepath.Join(outDir, "hello")
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
 	argv := append([]string{"-O0", "-std=c11", "-o", bin}, cFiles...)
 	out, err := exec.Command(cc, argv...).CombinedOutput()
 	if err != nil {
