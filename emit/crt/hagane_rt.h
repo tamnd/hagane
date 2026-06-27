@@ -157,10 +157,13 @@ typedef struct hg_type_s {
 
 /* Interface method table — one per (interface type, concrete type) pair.
    For concrete types without any interface methods (plain boxed into any),
-   methods == NULL. */
+   methods == NULL.
+   stringer is non-NULL when the concrete type has an Error() or String() method
+   that returns a string; used by hg_iface_fprint/sbuf for default %v printing. */
 typedef struct {
     const hg_type_t *type;    /* concrete type descriptor */
     void           **methods; /* method function pointers, in interface method order */
+    hg_string_t    (*stringer)(void*); /* optional: Error()/String() → string */
 } hg_iface_tab_t;
 
 /* Primitive type descriptors (defined in hagane_rt.c) */
@@ -249,6 +252,10 @@ void         hg_runtime_init(void);
 void         hg_throw(hg_iface_t val);
 hg_iface_t   hg_recover(void);
 void         hg_repanic(void);
+
+/* errors shim */
+hg_iface_t hg_errors_New(hg_string_t msg);
+static inline void hg_errors_init(void) {}
 
 /* fmt stubs (called from generated init functions) */
 static inline void hg_fmt_init(void) {}

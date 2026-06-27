@@ -305,6 +305,11 @@ static void hg_iface_fprint(FILE *f, hg_iface_t v) {
         return;
     }
     default: {
+        if (tab->stringer) {
+            hg_string_t s = tab->stringer(v.data);
+            fprintf(f, "%.*s", (int)s.len, s.ptr ? s.ptr : "");
+            return;
+        }
         const char *nm = (tab->type && tab->type->name) ? tab->type->name : "?";
         fprintf(f, "<%s Value>", nm);
         return;
@@ -569,6 +574,11 @@ static void hg_iface_sbuf(hg_sbuf_t *b, hg_iface_t v) {
         return;
     }
     default: {
+        if (tab->stringer) {
+            hg_string_t s = tab->stringer(v.data);
+            hg_sbuf_writes(b, s.ptr ? s.ptr : "", s.ptr ? (size_t)s.len : 0);
+            return;
+        }
         const char *name = (tab->type && tab->type->name) ? tab->type->name : "?";
         hg_sbuf_writes(b, "<", 1);
         hg_sbuf_writes(b, name, strlen(name));
@@ -646,4 +656,28 @@ hg_string_t hg_fmt_sprintf(hg_string_t fmt_str, hg_slice_hg_iface_t_t args) {
     hg_sbuf_grow(&b, 1);
     b.data[b.len] = '\0';
     return (hg_string_t){.ptr = b.data, .len = (int64_t)b.len};
+}
+
+/* ── errors shim ─────────────────────────────────────────────────────────── */
+
+typedef struct { hg_string_t msg; } hg_errors_errorString_t;
+
+static hg_string_t hg_errors_errorString_Error(void *self) {
+    return ((hg_errors_errorString_t*)self)->msg;
+}
+
+static const hg_type_t hg_type_errors_errorString = {
+    sizeof(hg_errors_errorString_t), HG_KIND_STRUCT, "*errors.errorString", NULL
+};
+static void *hg_errors_errorString_methods[] = { (void*)hg_errors_errorString_Error };
+static const hg_iface_tab_t hg_itab_errors_errorString = {
+    &hg_type_errors_errorString,
+    hg_errors_errorString_methods,
+    hg_errors_errorString_Error,
+};
+
+hg_iface_t hg_errors_New(hg_string_t msg) {
+    hg_errors_errorString_t *s = (hg_errors_errorString_t*)hg_alloc(sizeof(hg_errors_errorString_t));
+    s->msg = msg;
+    return (hg_iface_t){.itab = (const void*)&hg_itab_errors_errorString, .data = s};
 }
