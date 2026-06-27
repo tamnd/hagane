@@ -27,7 +27,7 @@ typedef struct { float  re, im; } hg_complex64_t;
 typedef struct { double re, im; } hg_complex128_t;
 
 /* ── opaque runtime types ────────────────────────────────────────────────── */
-typedef struct hg_map  hg_map_t;
+typedef struct hg_map  hg_map_t;   /* completed in hagane_map.h */
 typedef struct hg_chan hg_chan_t;
 
 /* ── common slice types ──────────────────────────────────────────────────── */

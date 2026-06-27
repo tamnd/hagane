@@ -142,6 +142,7 @@ func (pe *pkgEmitter) emitFunc(fn *ssa.Function) {
 
 	fmt.Fprintf(b, "%s {\n", pe.funcSignature(fn))
 	pe.emitLocalDecls(fn, b)
+	pe.emitRangeDecls(fn, b)
 
 	for i, blk := range fn.Blocks {
 		if i == 0 {

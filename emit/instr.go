@@ -151,35 +151,35 @@ func (pe *pkgEmitter) emitInstr(fn *ssa.Function, blk *ssa.BasicBlock, instr ssa
 		fmt.Fprintf(b, "    /* Select: not supported in M0 */\n")
 
 	case *ssa.MapUpdate:
-		fmt.Fprintf(b, "    /* MapUpdate: not supported in M0 */\n")
+		// m[key] = val  or  delete(m, key)
+		mName := pe.emitValue(v.Map)
+		kName := pe.emitValue(v.Key)
+		valName := pe.emitValue(v.Value)
+		kt := pe.e.cTypeOf(v.Key.Type())
+		vt := pe.e.cTypeOf(v.Value.Type())
+		fmt.Fprintf(b, "    { %s _k = %s; %s _v = %s; hg_map_set(%s, &_k, &_v); }\n",
+			kt, kName, vt, valName, mName)
 
 	case *ssa.Lookup:
-		ct := pe.e.cTypeOf(v.Type())
-		fmt.Fprintf(b, "    %s %s; memset(&%s, 0, sizeof(%s)); /* Lookup M0 stub */\n",
-			ct, valueName(v), valueName(v), valueName(v))
+		pe.emitLookup(v, b)
 
 	case *ssa.MakeMap:
-		ct := pe.e.cTypeOf(v.Type())
-		fmt.Fprintf(b, "    %s %s = NULL; /* MakeMap M0 stub */\n", ct, valueName(v))
+		pe.emitMakeMap(v, b)
 
 	case *ssa.MakeChan:
 		ct := pe.e.cTypeOf(v.Type())
-		fmt.Fprintf(b, "    %s %s = NULL; /* MakeChan M0 stub */\n", ct, valueName(v))
+		fmt.Fprintf(b, "    %s %s = NULL; /* MakeChan: M4 */\n", ct, valueName(v))
 
 	case *ssa.MakeClosure:
 		ct := pe.e.cTypeOf(v.Type())
-		fmt.Fprintf(b, "    %s %s; memset(&%s, 0, sizeof(%s)); /* MakeClosure M0 stub */\n",
+		fmt.Fprintf(b, "    %s %s; memset(&%s, 0, sizeof(%s)); /* MakeClosure: M2 */\n",
 			ct, valueName(v), valueName(v), valueName(v))
 
 	case *ssa.Next:
-		ct := pe.e.cTypeOf(v.Type())
-		fmt.Fprintf(b, "    %s %s; memset(&%s, 0, sizeof(%s)); /* Next M0 stub */\n",
-			ct, valueName(v), valueName(v), valueName(v))
+		pe.emitNext(v, b)
 
 	case *ssa.Range:
-		ct := pe.e.cTypeOf(v.Type())
-		fmt.Fprintf(b, "    %s %s; memset(&%s, 0, sizeof(%s)); /* Range M0 stub */\n",
-			ct, valueName(v), valueName(v), valueName(v))
+		pe.emitRange(v, b)
 
 	case *ssa.DebugRef:
 		// nothing to emit
@@ -431,7 +431,7 @@ func (pe *pkgEmitter) emitBuiltin(name string, args []ssa.Value, v *ssa.Call, b 
 			arr := args[0].Type().Underlying().(*types.Array)
 			fmt.Fprintf(b, "    %s %s = (%s)%d;\n", ct, valueName(v), ct, arr.Len())
 		case *types.Map:
-			fmt.Fprintf(b, "    %s %s = 0; /* map len M0 stub */\n", ct, valueName(v))
+			fmt.Fprintf(b, "    %s %s = (%s)hg_map_len(%s);\n", ct, valueName(v), ct, x)
 		default:
 			fmt.Fprintf(b, "    %s %s = 0; /* len: unknown type */\n", ct, valueName(v))
 		}
@@ -512,7 +512,12 @@ func (pe *pkgEmitter) emitBuiltin(name string, args []ssa.Value, v *ssa.Call, b 
 		fmt.Fprintf(b, "    %s %s = (%s)hg_alloc(sizeof(%s));\n", ct, valueName(v), ct, elemCT)
 
 	case "delete":
-		fmt.Fprintf(b, "    /* delete: M0 stub */\n")
+		if len(args) >= 2 {
+			mName := pe.emitValue(args[0])
+			kName := pe.emitValue(args[1])
+			kct := pe.e.cTypeOf(args[1].Type())
+			fmt.Fprintf(b, "    { %s _dk = %s; hg_map_delete(%s, &_dk); }\n", kct, kName, mName)
+		}
 
 	case "close":
 		fmt.Fprintf(b, "    /* close: M0 stub */\n")
@@ -986,5 +991,210 @@ func escapeCStr(s string) string {
 		}
 	}
 	return sb.String()
+}
+
+// ── M1: map and range ─────────────────────────────────────────────────────────
+
+// mapKeyHashEq returns the hash/eq function names for a given key C type.
+// For unknown types it emits a bytes-hash helper once into the header.
+func (pe *pkgEmitter) mapKeyHashEq(kt *types.Basic) (hashFn, eqFn string) {
+	switch kt.Kind() {
+	case types.Bool:
+		return "hg_hash_i8", "hg_eq_bool"
+	case types.Int8:
+		return "hg_hash_i8", "hg_eq_i8"
+	case types.Int16:
+		return "hg_hash_i16", "hg_eq_i16"
+	case types.Int32: // rune is int32
+		return "hg_hash_i32", "hg_eq_i32"
+	case types.Int, types.Int64:
+		return "hg_hash_i64", "hg_eq_i64"
+	case types.Uint8: // byte is uint8
+		return "hg_hash_i8", "hg_eq_u8"
+	case types.Uint16:
+		return "hg_hash_i16", "hg_eq_u16"
+	case types.Uint32:
+		return "hg_hash_i32", "hg_eq_u32"
+	case types.Uint, types.Uint64, types.Uintptr:
+		return "hg_hash_i64", "hg_eq_u64"
+	case types.String:
+		return "hg_hash_str", "hg_eq_str"
+	default:
+		return "hg_hash_i64", "hg_eq_i64"
+	}
+}
+
+// mapKeyHashEqForType returns hash/eq for any key type.
+func (pe *pkgEmitter) mapKeyHashEqForType(t types.Type) (hashFn, eqFn string) {
+	switch u := t.Underlying().(type) {
+	case *types.Basic:
+		return pe.mapKeyHashEq(u)
+	case *types.Pointer:
+		return "hg_hash_ptr", "hg_eq_ptr"
+	default:
+		// fallback: byte-hash over key size (works for structs etc.)
+		ct := pe.e.cTypeOf(t)
+		name := mangle(ct)
+		hashName := "hg_hash_" + name
+		eqName := "hg_eq_" + name
+		if !pe.e.mapFuncs[hashName] {
+			pe.e.mapFuncs[hashName] = true
+			fmt.Fprintf(pe.e.hdrbuf,
+				"static uint32_t %s(const void *k, uint32_t s) { return hg_hash_bytes(k, sizeof(%s), s); }\n",
+				hashName, ct)
+			fmt.Fprintf(pe.e.hdrbuf,
+				"static bool %s(const void *a, const void *b) { return memcmp(a, b, sizeof(%s)) == 0; }\n",
+				eqName, ct)
+		}
+		return hashName, eqName
+	}
+}
+
+func (pe *pkgEmitter) emitMakeMap(v *ssa.MakeMap, b *bytes.Buffer) {
+	mt := v.Type().Underlying().(*types.Map)
+	kt := mt.Key()
+	vt := mt.Elem()
+	kct := pe.e.cTypeOf(kt)
+	vct := pe.e.cTypeOf(vt)
+	hashFn, eqFn := pe.mapKeyHashEqForType(kt)
+	hint := "0"
+	if v.Reserve != nil {
+		hint = pe.emitValue(v.Reserve)
+	}
+	fmt.Fprintf(b, "    hg_map_t* %s = hg_map_new(sizeof(%s), sizeof(%s), %s, %s, (int64_t)(%s));\n",
+		valueName(v), kct, vct, hashFn, eqFn, hint)
+}
+
+func (pe *pkgEmitter) emitLookup(v *ssa.Lookup, b *bytes.Buffer) {
+	// Determine if this is map or string lookup.
+	xType := v.X.Type().Underlying()
+	switch xType.(type) {
+	case *types.Map:
+		pe.emitMapLookup(v, b)
+	case *types.Basic: // string index
+		ct := pe.e.cTypeOf(v.Type())
+		x := pe.emitValue(v.X)
+		idx := pe.emitValue(v.Index)
+		pos := pe.posStr(v.Pos())
+		if v.CommaOk {
+			// string index with comma-ok: returns (byte, bool)
+			// go/ssa emits this as a tuple; Extract pulls out fields
+			fmt.Fprintf(b, "    // string index comma-ok not common; stub\n")
+			fmt.Fprintf(b, "    %s %s; memset(&%s, 0, sizeof(%s));\n", ct, valueName(v), valueName(v), valueName(v))
+		} else {
+			fmt.Fprintf(b, "    hg_bounds_check(%s, %s.len, \"%s\", 0);\n", idx, x, pos)
+			fmt.Fprintf(b, "    %s %s = (uint8_t)%s.ptr[%s];\n", ct, valueName(v), x, idx)
+		}
+	}
+}
+
+// emitMapLookup handles v, ok := m[key] and v := m[key].
+func (pe *pkgEmitter) emitMapLookup(v *ssa.Lookup, b *bytes.Buffer) {
+	mt := v.X.Type().Underlying().(*types.Map)
+	kct := pe.e.cTypeOf(mt.Key())
+	vct := pe.e.cTypeOf(mt.Elem())
+	mName := pe.emitValue(v.X)
+	kName := pe.emitValue(v.Index)
+
+	if v.CommaOk {
+		// Extract #0 = val, Extract #1 = ok  (Go's map comma-ok ordering)
+		tupleName := pe.emitNextType(vct, "bool")
+		fmt.Fprintf(b, "    %s %s; memset(&%s, 0, sizeof(%s));\n",
+			tupleName, valueName(v), valueName(v), valueName(v))
+		fmt.Fprintf(b, "    { %s _k = %s; %s _v; memset(&_v,0,sizeof(_v)); %s.r1 = hg_map_get(%s, &_k, &_v); if (%s.r1) %s.r0 = _v; }\n",
+			kct, kName, vct, valueName(v), mName, valueName(v), valueName(v))
+	} else {
+		fmt.Fprintf(b, "    %s %s; memset(&%s, 0, sizeof(%s));\n",
+			vct, valueName(v), valueName(v), valueName(v))
+		fmt.Fprintf(b, "    { %s _k = %s; hg_map_get(%s, &_k, &%s); }\n",
+			kct, kName, mName, valueName(v))
+	}
+}
+
+// emitNextType ensures a tuple typedef `typedef struct { T0 r0; T1 r1; } name;` exists
+// and returns its name. Used for map Lookup(comma-ok) and Next results.
+func (pe *pkgEmitter) emitNextType(t0, t1 string) string {
+	name := fmt.Sprintf("hg_tup_%s_%s_t", mangle(t0), mangle(t1))
+	if !pe.e.nextTypes[name] {
+		pe.e.nextTypes[name] = true
+		fmt.Fprintf(pe.e.hdrbuf, "typedef struct { %s r0; %s r1; } %s;\n", t0, t1, name)
+	}
+	return name
+}
+
+// emitNextType3 ensures a 3-field tuple typedef exists and returns its name.
+func (pe *pkgEmitter) emitNextType3(t0, t1, t2 string) string {
+	name := fmt.Sprintf("hg_tup3_%s_%s_%s_t", mangle(t0), mangle(t1), mangle(t2))
+	if !pe.e.nextTypes[name] {
+		pe.e.nextTypes[name] = true
+		fmt.Fprintf(pe.e.hdrbuf, "typedef struct { %s r0; %s r1; %s r2; } %s;\n", t0, t1, t2, name)
+	}
+	return name
+}
+
+func (pe *pkgEmitter) emitRange(v *ssa.Range, b *bytes.Buffer) {
+	vn := valueName(v)
+	xt := v.X.Type().Underlying()
+	switch xt.(type) {
+	case *types.Basic: // string
+		xName := pe.emitValue(v.X)
+		fmt.Fprintf(b, "    %s.s = %s; %s.pos = 0;\n", vn, xName, vn)
+	case *types.Map:
+		mName := pe.emitValue(v.X)
+		fmt.Fprintf(b, "    hg_map_iter_init(%s, &%s);\n", mName, vn)
+	default:
+		fmt.Fprintf(b, "    /* Range: unsupported type %T */\n", xt)
+	}
+}
+
+func (pe *pkgEmitter) emitNext(v *ssa.Next, b *bytes.Buffer) {
+	iterName := valueName(v.Iter)
+	vn := valueName(v)
+
+	if v.IsString {
+		fmt.Fprintf(b, "    %s = hg_string_iter_next(&%s);\n", vn, iterName)
+		return
+	}
+
+	// map Next: (bool ok, K key, V val)
+	fmt.Fprintf(b, "    memset(&%s, 0, sizeof(%s));\n", vn, vn)
+	fmt.Fprintf(b, "    %s.r0 = hg_map_iter_next(&%s, &%s.r1, &%s.r2);\n", vn, iterName, vn, vn)
+}
+
+// emitRangeDecls declares Range iterator and Next result variables at function top.
+func (pe *pkgEmitter) emitRangeDecls(fn *ssa.Function, b *bytes.Buffer) {
+	for _, blk := range fn.Blocks {
+		for _, instr := range blk.Instrs {
+			switch v := instr.(type) {
+			case *ssa.Range:
+				vn := valueName(v)
+				xt := v.X.Type().Underlying()
+				switch xt.(type) {
+				case *types.Basic:
+					fmt.Fprintf(b, "    hg_string_iter_t %s; memset(&%s, 0, sizeof(%s));\n", vn, vn, vn)
+				case *types.Map:
+					fmt.Fprintf(b, "    hg_map_iter_t %s; memset(&%s, 0, sizeof(%s));\n", vn, vn, vn)
+				default:
+					fmt.Fprintf(b, "    void *%s = NULL;\n", vn)
+				}
+			case *ssa.Next:
+				vn := valueName(v)
+				if v.IsString {
+					fmt.Fprintf(b, "    hg_string_next_t %s; memset(&%s, 0, sizeof(%s));\n", vn, vn, vn)
+				} else {
+					rng, ok := v.Iter.(*ssa.Range)
+					if !ok {
+						fmt.Fprintf(b, "    /* Next: iter is not Range; unsupported */\n")
+						continue
+					}
+					mt := rng.X.Type().Underlying().(*types.Map)
+					kct := pe.e.cTypeOf(mt.Key())
+					vct := pe.e.cTypeOf(mt.Elem())
+					tupleName := pe.emitNextType3("bool", kct, vct)
+					fmt.Fprintf(b, "    %s %s; memset(&%s, 0, sizeof(%s));\n", tupleName, vn, vn, vn)
+				}
+			}
+		}
+	}
 }
 
