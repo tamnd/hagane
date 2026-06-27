@@ -89,15 +89,22 @@ func (pe *pkgEmitter) emitInstr(fn *ssa.Function, blk *ssa.BasicBlock, instr ssa
 		toT := v.Type().Underlying()
 		ct := pe.e.cTypeOf(v.Type())
 		xName := pe.emitValue(v.X)
-		// string ↔ []byte conversions
+		// string ↔ []byte — must copy so the slice is mutable
 		if isString(fromT) && isByteSlice(toT) {
-			fmt.Fprintf(b, "    %s %s; { hg_slice_uint8_t _bs = {.ptr=(uint8_t*)%s.ptr, .len=%s.len, .cap=%s.len}; %s=_bs; }\n",
-				ct, valueName(v), xName, xName, xName, valueName(v))
+			fmt.Fprintf(b, "    %s %s = hg_string_to_bytes(%s);\n", ct, valueName(v), xName)
 			return
 		}
 		if isByteSlice(fromT) && isString(toT) {
-			fmt.Fprintf(b, "    %s %s = (hg_string_t){.ptr=(const char*)%s.ptr, .len=%s.len};\n",
-				ct, valueName(v), xName, xName)
+			fmt.Fprintf(b, "    %s %s = hg_bytes_to_string(%s);\n", ct, valueName(v), xName)
+			return
+		}
+		// string ↔ []rune ([]int32)
+		if isString(fromT) && isRuneSlice(toT) {
+			fmt.Fprintf(b, "    %s %s = hg_string_to_runes(%s);\n", ct, valueName(v), xName)
+			return
+		}
+		if isRuneSlice(fromT) && isString(toT) {
+			fmt.Fprintf(b, "    %s %s = hg_runes_to_string(%s);\n", ct, valueName(v), xName)
 			return
 		}
 		fmt.Fprintf(b, "    %s %s = (%s)(%s);\n", ct, valueName(v), ct, xName)
@@ -1280,6 +1287,15 @@ func isByteSlice(t types.Type) bool {
 	}
 	b, ok := sl.Elem().Underlying().(*types.Basic)
 	return ok && b.Kind() == types.Uint8
+}
+
+func isRuneSlice(t types.Type) bool {
+	sl, ok := t.(*types.Slice)
+	if !ok {
+		return false
+	}
+	b, ok := sl.Elem().Underlying().(*types.Basic)
+	return ok && (b.Kind() == types.Int32 || b.Kind() == types.Rune)
 }
 
 func intSuffix(k types.BasicKind) string {

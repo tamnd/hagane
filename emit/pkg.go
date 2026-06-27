@@ -299,9 +299,12 @@ func valueName(v ssa.Value) string {
 
 func sanitizeName(n string) string {
 	// Handle method names like "(Point).Distance" → "Point_Distance"
-	// and "(T).Method" patterns
+	// and "(T).Method" patterns, plus composite type strings like "[]int" or "map[K]V".
 	n = strings.TrimPrefix(n, "(")
-	n = strings.NewReplacer(").", "_", ")", "_", "$", "_", ".", "_", "-", "_", "*", "ptr").Replace(n)
+	n = strings.NewReplacer(
+		").", "_", ")", "_", "$", "_", ".", "_", "-", "_", "*", "ptr",
+		"[", "sl_", "]", "", " ", "_", "{", "", "}", "",
+	).Replace(n)
 	switch n {
 	case "default", "return", "if", "else", "for", "while", "do",
 		"int", "long", "short", "char", "float", "double", "void",

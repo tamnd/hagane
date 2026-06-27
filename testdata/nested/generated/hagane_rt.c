@@ -121,6 +121,74 @@ static int64_t hg_copy_slice(hg_slice_uint8_t dst, hg_slice_uint8_t src, size_t 
     return n;
 }
 
+/* ── string conversion helpers ──────────────────────────────────────────── */
+
+hg_slice_uint8_t hg_string_to_bytes(hg_string_t s) {
+    if (s.len == 0) return (hg_slice_uint8_t){NULL, 0, 0};
+    uint8_t *p = (uint8_t*)hg_alloc((size_t)s.len);
+    memcpy(p, s.ptr, (size_t)s.len);
+    return (hg_slice_uint8_t){p, s.len, s.len};
+}
+
+hg_string_t hg_bytes_to_string(hg_slice_uint8_t b) {
+    if (b.len == 0) return HG_ZERO_STRING;
+    char *p = (char*)hg_alloc((size_t)b.len);
+    memcpy(p, b.ptr, (size_t)b.len);
+    return (hg_string_t){p, b.len};
+}
+
+/* Decode one UTF-8 sequence from *p (within end). Advances *p and returns rune.
+   Returns U+FFFD on invalid bytes. */
+static int32_t hg_utf8_decode(const char **p, const char *end) {
+    uint8_t b0 = (uint8_t)**p; (*p)++;
+    if (b0 < 0x80) return (int32_t)b0;
+    if (b0 < 0xC0) return 0xFFFD;
+    int32_t r; int n;
+    if      (b0 < 0xE0) { r = b0 & 0x1F; n = 1; }
+    else if (b0 < 0xF0) { r = b0 & 0x0F; n = 2; }
+    else                { r = b0 & 0x07; n = 3; }
+    for (int i = 0; i < n; i++) {
+        if (*p >= end) return 0xFFFD;
+        uint8_t c = (uint8_t)**p;
+        if ((c & 0xC0) != 0x80) return 0xFFFD;
+        r = (r << 6) | (c & 0x3F); (*p)++;
+    }
+    return r;
+}
+
+hg_slice_int32_t hg_string_to_runes(hg_string_t s) {
+    if (s.len == 0) return (hg_slice_int32_t){NULL, 0, 0};
+    /* Upper bound: one rune per byte */
+    int32_t *buf = (int32_t*)hg_alloc((size_t)s.len * sizeof(int32_t));
+    int64_t n = 0;
+    const char *p = s.ptr, *end = s.ptr + s.len;
+    while (p < end) buf[n++] = hg_utf8_decode(&p, end);
+    return (hg_slice_int32_t){buf, n, s.len};
+}
+
+/* Encode rune to UTF-8 in buf (must have at least 4 bytes). Returns bytes written. */
+static int hg_utf8_encode(int32_t r, char *buf) {
+    if (r < 0x80)  { buf[0]=(char)r; return 1; }
+    if (r < 0x800) { buf[0]=(char)(0xC0|(r>>6)); buf[1]=(char)(0x80|(r&0x3F)); return 2; }
+    if (r < 0x10000){ buf[0]=(char)(0xE0|(r>>12)); buf[1]=(char)(0x80|((r>>6)&0x3F)); buf[2]=(char)(0x80|(r&0x3F)); return 3; }
+    buf[0]=(char)(0xF0|(r>>18)); buf[1]=(char)(0x80|((r>>12)&0x3F));
+    buf[2]=(char)(0x80|((r>>6)&0x3F)); buf[3]=(char)(0x80|(r&0x3F)); return 4;
+}
+
+hg_string_t hg_runes_to_string(hg_slice_int32_t sl) {
+    if (sl.len == 0) return HG_ZERO_STRING;
+    size_t cap = (size_t)sl.len * 4;
+    char *buf = (char*)hg_alloc(cap);
+    size_t n = 0;
+    for (int64_t i = 0; i < sl.len; i++) n += (size_t)hg_utf8_encode(sl.ptr[i], buf + n);
+    /* shrink to actual length */
+    if (n < cap) {
+        char *s2 = (char*)realloc(buf, n > 0 ? n : 1);
+        if (s2) buf = s2;
+    }
+    return (hg_string_t){buf, (int64_t)n};
+}
+
 /* ── misc ────────────────────────────────────────────────────────────────── */
 
 void hg_memmove(void *dst, const void *src, size_t n) {
@@ -204,7 +272,43 @@ static void hg_iface_fprint(FILE *f, hg_iface_t v) {
         return;
     }
     case HG_KIND_UINTPTR: fprintf(f, "%llu", (unsigned long long)*(uintptr_t*)v.data); return;
-    default: fprintf(f, "<%s Value>", tab->type->name ? tab->type->name : "?"); return;
+    case HG_KIND_SLICE: {
+        if (!tab->type->elem) { fprintf(f, "[]"); return; }
+        const hg_rawslice_t *sl = (const hg_rawslice_t*)v.data;
+        const hg_type_t *et = tab->type->elem;
+        fprintf(f, "[");
+        for (int64_t i = 0; i < sl->len; i++) {
+            if (i > 0) fprintf(f, " ");
+            const void *ep = (const char*)sl->ptr + (size_t)((uint64_t)i * et->size);
+            switch (et->kind) {
+            case HG_KIND_BOOL:   fprintf(f, "%s", *(const bool*)ep ? "true" : "false"); break;
+            case HG_KIND_INT8:   fprintf(f, "%d", (int)*(const int8_t*)ep); break;
+            case HG_KIND_INT16:  fprintf(f, "%d", (int)*(const int16_t*)ep); break;
+            case HG_KIND_INT32:  fprintf(f, "%d", *(const int32_t*)ep); break;
+            case HG_KIND_INT: case HG_KIND_INT64:
+                                 fprintf(f, "%lld", (long long)*(const int64_t*)ep); break;
+            case HG_KIND_UINT8:  fprintf(f, "%u", (unsigned)*(const uint8_t*)ep); break;
+            case HG_KIND_UINT16: fprintf(f, "%u", (unsigned)*(const uint16_t*)ep); break;
+            case HG_KIND_UINT32: fprintf(f, "%u", *(const uint32_t*)ep); break;
+            case HG_KIND_UINT: case HG_KIND_UINT64:
+                                 fprintf(f, "%llu", (unsigned long long)*(const uint64_t*)ep); break;
+            case HG_KIND_FLOAT32: fprintf(f, "%g", (double)*(const float*)ep); break;
+            case HG_KIND_FLOAT64: fprintf(f, "%g", *(const double*)ep); break;
+            case HG_KIND_STRING: {
+                const hg_string_t *s = (const hg_string_t*)ep;
+                fprintf(f, "%.*s", (int)s->len, s->ptr ? s->ptr : ""); break;
+            }
+            default: fprintf(f, "?"); break;
+            }
+        }
+        fprintf(f, "]");
+        return;
+    }
+    default: {
+        const char *nm = (tab->type && tab->type->name) ? tab->type->name : "?";
+        fprintf(f, "<%s Value>", nm);
+        return;
+    }
     }
 }
 
@@ -394,8 +498,41 @@ static void hg_iface_sbuf(hg_sbuf_t *b, hg_iface_t v) {
         return;
     }
     case HG_KIND_UINTPTR: hg_sbuf_printf(b, "%llu", (unsigned long long)*(uintptr_t*)v.data); return;
+    case HG_KIND_SLICE: {
+        if (!tab->type->elem) { hg_sbuf_writes(b, "[]", 2); return; }
+        const hg_rawslice_t *sl = (const hg_rawslice_t*)v.data;
+        const hg_type_t *et = tab->type->elem;
+        hg_sbuf_writec(b, '[');
+        for (int64_t i = 0; i < sl->len; i++) {
+            if (i > 0) hg_sbuf_writec(b, ' ');
+            const void *ep = (const char*)sl->ptr + (size_t)((uint64_t)i * et->size);
+            switch (et->kind) {
+            case HG_KIND_BOOL:   hg_sbuf_writes(b, *(const bool*)ep ? "true":"false",
+                                               *(const bool*)ep ? 4:5); break;
+            case HG_KIND_INT8:   hg_sbuf_printf(b, "%d", (int)*(const int8_t*)ep); break;
+            case HG_KIND_INT16:  hg_sbuf_printf(b, "%d", (int)*(const int16_t*)ep); break;
+            case HG_KIND_INT32:  hg_sbuf_printf(b, "%d", *(const int32_t*)ep); break;
+            case HG_KIND_INT: case HG_KIND_INT64:
+                                 hg_sbuf_printf(b, "%lld", (long long)*(const int64_t*)ep); break;
+            case HG_KIND_UINT8:  hg_sbuf_printf(b, "%u", (unsigned)*(const uint8_t*)ep); break;
+            case HG_KIND_UINT16: hg_sbuf_printf(b, "%u", (unsigned)*(const uint16_t*)ep); break;
+            case HG_KIND_UINT32: hg_sbuf_printf(b, "%u", *(const uint32_t*)ep); break;
+            case HG_KIND_UINT: case HG_KIND_UINT64:
+                                 hg_sbuf_printf(b, "%llu", (unsigned long long)*(const uint64_t*)ep); break;
+            case HG_KIND_FLOAT32: hg_sbuf_printf(b, "%g", (double)*(const float*)ep); break;
+            case HG_KIND_FLOAT64: hg_sbuf_printf(b, "%g", *(const double*)ep); break;
+            case HG_KIND_STRING: {
+                const hg_string_t *s = (const hg_string_t*)ep;
+                hg_sbuf_writes(b, s->ptr ? s->ptr : "", s->ptr ? (size_t)s->len : 0); break;
+            }
+            default: hg_sbuf_writec(b, '?'); break;
+            }
+        }
+        hg_sbuf_writec(b, ']');
+        return;
+    }
     default: {
-        const char *name = tab->type->name ? tab->type->name : "?";
+        const char *name = (tab->type && tab->type->name) ? tab->type->name : "?";
         hg_sbuf_writes(b, "<", 1);
         hg_sbuf_writes(b, name, strlen(name));
         hg_sbuf_writes(b, " Value>", 7);
