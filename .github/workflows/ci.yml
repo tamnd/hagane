@@ -51,6 +51,7 @@ jobs:
       - name: test
         env:
           CGO_ENABLED: "0"
+          HAGANE_MILESTONE: "m2"
         run: go test -count=1 -coverprofile=coverage.out ./...
       - name: coverage summary
         if: matrix.os == 'ubuntu-latest'
