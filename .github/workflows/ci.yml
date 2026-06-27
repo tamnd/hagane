@@ -38,6 +38,7 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: gcc --version
       - name: gofmt
+        if: matrix.os != 'windows-latest'
         run: |
           unformatted=$(gofmt -s -l .)
           if [ -n "$unformatted" ]; then
