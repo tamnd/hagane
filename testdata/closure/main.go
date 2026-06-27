@@ -1,4 +1,4 @@
-//go:build !m0 && !m1
+//go:build !m0
 
 package main
 

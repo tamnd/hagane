@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 
 /* ── string ──────────────────────────────────────────────────────────────── */
 typedef struct { const char *ptr; int64_t len; } hg_string_t;
@@ -116,25 +117,99 @@ typedef struct { void       **ptr; int64_t len; int64_t cap; } hg_slice_voidptr_
 #define hg_shr_u32(a,b) ((uint32_t)(a) >> ((b)&31))
 #define hg_shr_u64(a,b) ((uint64_t)(a) >> ((b)&63))
 
-/* ── M0 type tags (encoded in itab for interface boxing) ─────────────────── */
-#define HG_TYPE_UNKNOWN  ((const void*)0)
-#define HG_TYPE_BOOL     ((const void*)1)
-#define HG_TYPE_INT8     ((const void*)2)
-#define HG_TYPE_INT16    ((const void*)3)
-#define HG_TYPE_INT32    ((const void*)4)
-#define HG_TYPE_INT64    ((const void*)5)
-#define HG_TYPE_UINT8    ((const void*)6)
-#define HG_TYPE_UINT16   ((const void*)7)
-#define HG_TYPE_UINT32   ((const void*)8)
-#define HG_TYPE_UINT64   ((const void*)9)
-#define HG_TYPE_FLOAT32  ((const void*)10)
-#define HG_TYPE_FLOAT64  ((const void*)11)
-#define HG_TYPE_STRING   ((const void*)12)
-#define HG_TYPE_UINTPTR  ((const void*)13)
+/* ── M3 type system ──────────────────────────────────────────────────────── */
+
+/* Type kind constants (matching reflect.Kind values) */
+#define HG_KIND_BOOL      1
+#define HG_KIND_INT       2
+#define HG_KIND_INT8      3
+#define HG_KIND_INT16     4
+#define HG_KIND_INT32     5
+#define HG_KIND_INT64     6
+#define HG_KIND_UINT      7
+#define HG_KIND_UINT8     8
+#define HG_KIND_UINT16    9
+#define HG_KIND_UINT32   10
+#define HG_KIND_UINT64   11
+#define HG_KIND_UINTPTR  12
+#define HG_KIND_FLOAT32  13
+#define HG_KIND_FLOAT64  14
+#define HG_KIND_STRING   24
+#define HG_KIND_STRUCT   25
+#define HG_KIND_PTR      22
+#define HG_KIND_SLICE    23
+#define HG_KIND_MAP      21
+#define HG_KIND_FUNC     19
+#define HG_KIND_IFACE    20
+#define HG_KIND_ARRAY    17
+
+/* Type descriptor — one per concrete type in the program */
+typedef struct hg_type_s {
+    uint32_t    size;   /* sizeof(T) */
+    uint8_t     kind;   /* HG_KIND_* */
+    const char *name;   /* package-qualified name */
+} hg_type_t;
+
+/* Interface method table — one per (interface type, concrete type) pair.
+   For concrete types without any interface methods (plain boxed into any),
+   methods == NULL. */
+typedef struct {
+    const hg_type_t *type;    /* concrete type descriptor */
+    void           **methods; /* method function pointers, in interface method order */
+} hg_iface_tab_t;
+
+/* Primitive type descriptors (defined in hagane_rt.c) */
+extern const hg_type_t hg_type_bool;
+extern const hg_type_t hg_type_int8;
+extern const hg_type_t hg_type_int16;
+extern const hg_type_t hg_type_int32;
+extern const hg_type_t hg_type_int64;
+extern const hg_type_t hg_type_uint8;
+extern const hg_type_t hg_type_uint16;
+extern const hg_type_t hg_type_uint32;
+extern const hg_type_t hg_type_uint64;
+extern const hg_type_t hg_type_float32;
+extern const hg_type_t hg_type_float64;
+extern const hg_type_t hg_type_string;
+extern const hg_type_t hg_type_uintptr;
+
+/* Primitive itab singletons (no method table) */
+extern const hg_iface_tab_t hg_itab_bool;
+extern const hg_iface_tab_t hg_itab_int8;
+extern const hg_iface_tab_t hg_itab_int16;
+extern const hg_iface_tab_t hg_itab_int32;
+extern const hg_iface_tab_t hg_itab_int64;
+extern const hg_iface_tab_t hg_itab_uint8;
+extern const hg_iface_tab_t hg_itab_uint16;
+extern const hg_iface_tab_t hg_itab_uint32;
+extern const hg_iface_tab_t hg_itab_uint64;
+extern const hg_iface_tab_t hg_itab_float32;
+extern const hg_iface_tab_t hg_itab_float64;
+extern const hg_iface_tab_t hg_itab_string;
+extern const hg_iface_tab_t hg_itab_uintptr;
+
+/* ── math helpers ────────────────────────────────────────────────────────── */
+static inline double hg_math_inf(int sign) { return sign >= 0 ? (1.0/0.0) : -(1.0/0.0); }
+static inline double hg_math_nan(void)     { return 0.0/0.0; }
+
+/* ── defer runtime ───────────────────────────────────────────────────────── */
+typedef struct hg_defer_s {
+    struct hg_defer_s *next;
+    void (*fn)(void *arg);
+    void  *arg;
+} hg_defer_t;
+
+static inline void hg_run_defers(hg_defer_t *head) {
+    for (hg_defer_t *d = head; d != NULL; d = d->next) {
+        d->fn(d->arg);
+    }
+}
 
 /* ── runtime functions ───────────────────────────────────────────────────── */
 void*        hg_alloc(size_t size);
 void*        hg_realloc(void *ptr, size_t old_size, size_t new_size);
+void         hg_panic_typeassert(const char *have, const char *want);
+void         hg_panic_iface_nil(const char *pos);
 hg_string_t  hg_string_concat(hg_string_t a, hg_string_t b);
 bool         hg_string_equal(hg_string_t a, hg_string_t b);
 int          hg_string_compare(hg_string_t a, hg_string_t b);
@@ -150,6 +225,7 @@ static inline void hg_fmt_init(void) {}
 void hg_fmt_println(hg_slice_hg_iface_t_t args);
 void hg_fmt_print(hg_slice_hg_iface_t_t args);
 void hg_fmt_printf(hg_string_t fmt, hg_slice_hg_iface_t_t args);
+hg_string_t hg_fmt_sprintf(hg_string_t fmt, hg_slice_hg_iface_t_t args);
 
 /* helper: print a Go string via printf */
 static inline void hg_print_string(hg_string_t s) {

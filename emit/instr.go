@@ -108,21 +108,35 @@ func (pe *pkgEmitter) emitInstr(fn *ssa.Function, blk *ssa.BasicBlock, instr ssa
 
 	case *ssa.ChangeInterface:
 		ct := pe.e.cTypeOf(v.Type())
-		fmt.Fprintf(b, "    %s %s = %s; /* ChangeInterface */\n", ct, valueName(v), pe.emitValue(v.X))
+		src := pe.emitValue(v.X)
+		// Trace the concrete type through the def-use chain to find the right itab.
+		if concreteT := traceConcreteType(v.X); concreteT != nil {
+			itab := pe.e.ifaceItabExpr(concreteT, v.Type())
+			fmt.Fprintf(b, "    %s %s; %s.data = (%s).data; %s.itab = (const void*)%s;\n",
+				ct, valueName(v), valueName(v), src, valueName(v), itab)
+		} else {
+			// Dynamic case: concrete type not statically known. Copy the raw interface
+			// value — method indices may be wrong if source and target interfaces
+			// have different method orderings. TODO: implement runtime itab lookup.
+			fmt.Fprintf(b, "    %s %s = %s; /* ChangeInterface: dynamic, indices may mismatch */\n", ct, valueName(v), src)
+		}
 
 	case *ssa.MakeInterface:
 		ct := pe.e.cTypeOf(v.Type())
 		xName := pe.emitValue(v.X)
 		xt := pe.e.cTypeOf(v.X.Type())
-		tag := m0TypeTag(v.X.Type())
-		fmt.Fprintf(b, "    %s %s; { %s *_box = (%s*)hg_alloc(sizeof(%s)); *_box = %s; %s.data = _box; %s.itab = %s; }\n",
-			ct, valueName(v), xt, xt, xt, xName, valueName(v), valueName(v), tag)
+		itab := pe.e.ifaceItabExpr(v.X.Type(), v.Type())
+		// For pointer types, store the pointer directly in data (no extra boxing).
+		if _, isPtr := v.X.Type().Underlying().(*types.Pointer); isPtr {
+			fmt.Fprintf(b, "    %s %s; %s.data = (void*)(%s); %s.itab = (const void*)%s;\n",
+				ct, valueName(v), valueName(v), xName, valueName(v), itab)
+		} else {
+			fmt.Fprintf(b, "    %s %s; { %s *_box = (%s*)hg_alloc(sizeof(%s)); *_box = %s; %s.data = _box; %s.itab = (const void*)%s; }\n",
+				ct, valueName(v), xt, xt, xt, xName, valueName(v), valueName(v), itab)
+		}
 
 	case *ssa.TypeAssert:
-		// M0: panic on type mismatch (no reflect yet)
-		ct := pe.e.cTypeOf(v.Type())
-		fmt.Fprintf(b, "    %s %s; memset(&%s, 0, sizeof(%s)); /* TypeAssert M0 stub */\n",
-			ct, valueName(v), valueName(v), valueName(v))
+		pe.emitTypeAssert(v, b)
 
 	case *ssa.Extract:
 		// extract field from multi-return struct
@@ -135,11 +149,10 @@ func (pe *pkgEmitter) emitInstr(fn *ssa.Function, blk *ssa.BasicBlock, instr ssa
 		fmt.Fprintf(b, "    hg_panic(\"explicit panic\", \"%s\", 0);\n", pos)
 
 	case *ssa.RunDefers:
-		// M0 stub: defers not supported yet
-		fmt.Fprintf(b, "    /* RunDefers: not supported in M0 */\n")
+		fmt.Fprintf(b, "    hg_run_defers(_hg_defer_head);\n")
 
 	case *ssa.Defer:
-		fmt.Fprintf(b, "    /* Defer: not supported in M0 */\n")
+		pe.emitDefer(v, b)
 
 	case *ssa.Go:
 		fmt.Fprintf(b, "    /* Go (goroutine): not supported in M0 */\n")
@@ -171,9 +184,7 @@ func (pe *pkgEmitter) emitInstr(fn *ssa.Function, blk *ssa.BasicBlock, instr ssa
 		fmt.Fprintf(b, "    %s %s = NULL; /* MakeChan: M4 */\n", ct, valueName(v))
 
 	case *ssa.MakeClosure:
-		ct := pe.e.cTypeOf(v.Type())
-		fmt.Fprintf(b, "    %s %s; memset(&%s, 0, sizeof(%s)); /* MakeClosure: M2 */\n",
-			ct, valueName(v), valueName(v), valueName(v))
+		pe.emitMakeClosure(v, b)
 
 	case *ssa.Next:
 		pe.emitNext(v, b)
@@ -285,12 +296,29 @@ func (pe *pkgEmitter) emitBinOp(v *ssa.BinOp, b *bytes.Buffer) {
 	case token.EQL:
 		if isString(v.X.Type().Underlying()) {
 			expr = fmt.Sprintf("hg_string_equal(%s, %s)", x, y)
+		} else if _, isIface := v.X.Type().Underlying().(*types.Interface); isIface {
+			// Interface equality: compare itab pointers (nil check is itab == NULL)
+			if isNilConst(v.Y) {
+				expr = fmt.Sprintf("(%s).itab == NULL", x)
+			} else if isNilConst(v.X) {
+				expr = fmt.Sprintf("(%s).itab == NULL", y)
+			} else {
+				expr = fmt.Sprintf("((%s).itab == (%s).itab && (%s).data == (%s).data)", x, y, x, y)
+			}
 		} else {
 			expr = fmt.Sprintf("%s == %s", x, y)
 		}
 	case token.NEQ:
 		if isString(v.X.Type().Underlying()) {
 			expr = fmt.Sprintf("!hg_string_equal(%s, %s)", x, y)
+		} else if _, isIface := v.X.Type().Underlying().(*types.Interface); isIface {
+			if isNilConst(v.Y) {
+				expr = fmt.Sprintf("(%s).itab != NULL", x)
+			} else if isNilConst(v.X) {
+				expr = fmt.Sprintf("(%s).itab != NULL", y)
+			} else {
+				expr = fmt.Sprintf("((%s).itab != (%s).itab || (%s).data != (%s).data)", x, y, x, y)
+			}
 		} else {
 			expr = fmt.Sprintf("%s != %s", x, y)
 		}
@@ -369,11 +397,65 @@ func (pe *pkgEmitter) emitCall(v *ssa.Call, b *bytes.Buffer) {
 	if !cc.IsInvoke() {
 		if fn, ok := cc.Value.(*ssa.Function); ok {
 			if frontend.IsFmtPrint(fn) {
+				switch fn.Name() {
+				case "Sprintf":
+					// Returns hg_string_t; emit hg_fmt_sprintf(fmtArg, argsSlice)
+					ct := pe.e.cTypeOf(v.Type())
+					fmtArg := pe.emitValue(cc.Args[0])
+					if len(cc.Args) >= 2 && isIfaceSlice(cc.Args[1].Type()) {
+						fmt.Fprintf(b, "    %s %s = hg_fmt_sprintf(%s, %s);\n",
+							ct, valueName(v), fmtArg, pe.emitValue(cc.Args[1]))
+					} else {
+						fmt.Fprintf(b, "    %s %s = hg_fmt_sprintf(%s, HG_ZERO_SLICE(hg_slice_hg_iface_t_t));\n",
+							ct, valueName(v), fmtArg)
+					}
+					return
+				case "Errorf":
+					// Returns error interface; box a string error value
+					fmtArg := pe.emitValue(cc.Args[0])
+					var sprintfCall string
+					if len(cc.Args) >= 2 && isIfaceSlice(cc.Args[1].Type()) {
+						sprintfCall = fmt.Sprintf("hg_fmt_sprintf(%s, %s)", fmtArg, pe.emitValue(cc.Args[1]))
+					} else {
+						sprintfCall = fmt.Sprintf("hg_fmt_sprintf(%s, HG_ZERO_SLICE(hg_slice_hg_iface_t_t))", fmtArg)
+					}
+					ct := pe.e.cTypeOf(v.Type())
+					fmt.Fprintf(b, "    %s %s; { hg_string_t *_box = (hg_string_t*)hg_alloc(sizeof(hg_string_t)); *_box = %s; %s.data = _box; %s.itab = (const void*)&hg_itab_string; }\n",
+						ct, valueName(v), sprintfCall, valueName(v), valueName(v))
+					return
+				}
 				pe.emitFmtCall(fn.Name(), cc.Args, b)
 				return
 			}
+			// math package → C <math.h> (must check before skipPkg)
+			if mathCFn, ok := mathMapping[fn.Package().Pkg.Path()+"."+fn.Name()]; ok {
+				args := pe.formatArgs(cc.Args)
+				ct := pe.e.cTypeOf(v.Type())
+				if ct == "" || ct == "void" || v.Type() == types.Typ[types.Invalid] {
+					fmt.Fprintf(b, "    %s(%s);\n", mathCFn, args)
+				} else {
+					fmt.Fprintf(b, "    %s %s = (%s)%s(%s);\n", ct, valueName(v), ct, mathCFn, args)
+				}
+				return
+			}
+			// skip calls to packages we don't transpile (init, etc.)
+			if skipPkg(fn.Package()) {
+				t := v.Type()
+				if t != nil && t != types.Typ[types.Invalid] {
+					if _, isTuple := t.(*types.Tuple); !isTuple {
+						ct := pe.e.cTypeOf(t)
+						if ct != "" && ct != "void" && !strings.HasPrefix(ct, "/*") {
+							fmt.Fprintf(b, "    %s %s; memset(&%s, 0, sizeof(%s)); /* %s.%s skipped */\n",
+								ct, valueName(v), valueName(v), valueName(v), fn.Package().Pkg.Path(), fn.Name())
+							return
+						}
+					}
+				}
+				fmt.Fprintf(b, "    /* call to %s.%s skipped */\n", fn.Package().Pkg.Path(), fn.Name())
+				return
+			}
 			// direct call
-			cname := pkgCPrefix(fn.Package().Pkg.Path()) + sanitizeName(fn.Name())
+			cname := pkgCPrefix(fn.Package().Pkg.Path()) + methodCBaseName(fn)
 			args := pe.formatArgs(cc.Args)
 			if v.Type() == nil || v.Type() == types.Typ[types.Invalid] {
 				fmt.Fprintf(b, "    %s(%s);\n", cname, args)
@@ -387,7 +469,7 @@ func (pe *pkgEmitter) emitCall(v *ssa.Call, b *bytes.Buffer) {
 				fmt.Fprintf(b, "    %s %s = %s(%s);\n", ct, valueName(v), cname, args)
 			} else {
 				// multi-return: store in a temp struct
-				retTypeName := retStructName(pkgCPrefix(fn.Package().Pkg.Path()), sanitizeName(fn.Name()))
+				retTypeName := retStructName(pkgCPrefix(fn.Package().Pkg.Path()), methodCBaseName(fn))
 				fmt.Fprintf(b, "    %s %s = %s(%s);\n", retTypeName, valueName(v), cname, args)
 			}
 			return
@@ -399,14 +481,190 @@ func (pe *pkgEmitter) emitCall(v *ssa.Call, b *bytes.Buffer) {
 		}
 	}
 
-	// fallback: indirect or invoke call
-	ct := pe.e.cTypeOf(v.Type())
-	if ct == "void" || v.Type() == nil || v.Type() == types.Typ[types.Invalid] {
-		fmt.Fprintf(b, "    /* indirect/invoke call M0 stub */\n")
+	// Indirect call through a function value (hg_func_t) or interface method
+	pe.emitIndirectCall(v, b)
+}
+
+func (pe *pkgEmitter) emitIndirectCall(v *ssa.Call, b *bytes.Buffer) {
+	cc := v.Call
+
+	// Interface method call (Invoke)
+	if cc.IsInvoke() {
+		pe.emitInvokeCall(v, b)
 		return
 	}
-	fmt.Fprintf(b, "    %s %s; memset(&%s, 0, sizeof(%s)); /* indirect/invoke call M0 stub */\n",
-		ct, valueName(v), valueName(v), valueName(v))
+
+	// Indirect call through a function value
+	callee := cc.Value
+	calleeName := pe.emitValue(callee)
+	sig, _ := callee.Type().Underlying().(*types.Signature)
+	if sig == nil {
+		fmt.Fprintf(b, "    /* indirect call: no signature */\n")
+		return
+	}
+
+	// build C cast type for the callee function pointer
+	retCT := pe.sigReturnCType(sig)
+	var paramCTs []string
+	paramCTs = append(paramCTs, "void*") // env pointer
+	for i := 0; i < sig.Params().Len(); i++ {
+		paramCTs = append(paramCTs, pe.e.cTypeOf(sig.Params().At(i).Type()))
+	}
+
+	// build argument list: env + call args
+	var callArgs []string
+	callArgs = append(callArgs, calleeName+".env")
+	for _, arg := range cc.Args {
+		callArgs = append(callArgs, pe.emitValue(arg))
+	}
+
+	castExpr := fmt.Sprintf("((%s(*)(%s))%s.fn)", retCT, strings.Join(paramCTs, ","), calleeName)
+	callExpr := fmt.Sprintf("%s(%s)", castExpr, strings.Join(callArgs, ","))
+
+	results := sig.Results()
+	hasResult := v.Type() != nil && results.Len() > 0
+	if !hasResult {
+		fmt.Fprintf(b, "    %s;\n", callExpr)
+	} else if results.Len() == 1 {
+		ct := pe.e.cTypeOf(v.Type())
+		fmt.Fprintf(b, "    %s %s = %s;\n", ct, valueName(v), callExpr)
+	} else {
+		// multi-return — we need a struct type for the anon func return
+		// TODO: emit return struct typedef
+		ct := pe.e.cTypeOf(v.Type())
+		fmt.Fprintf(b, "    %s %s = %s;\n", ct, valueName(v), callExpr)
+	}
+}
+
+func (pe *pkgEmitter) emitInvokeCall(v *ssa.Call, b *bytes.Buffer) {
+	cc := v.Call
+	iface := pe.emitValue(cc.Value)
+
+	// Find the method index in the interface method set (alphabetically sorted).
+	ifaceType, ok := cc.Value.Type().Underlying().(*types.Interface)
+	if !ok {
+		fmt.Fprintf(b, "    /* invoke: not an interface type */\n")
+		return
+	}
+
+	// Nil interface method dispatch panics in Go.
+	pos := pe.posStr(v.Pos())
+	fmt.Fprintf(b, "    if (!(%s).itab) hg_panic_iface_nil(\"%s\");\n", iface, pos)
+
+	methodIdx := ifaceMethodIndex(ifaceType, cc.Method)
+
+	// Build argument list: iface.data + call args
+	var callArgs []string
+	callArgs = append(callArgs, iface+".data")
+	for _, arg := range cc.Args {
+		callArgs = append(callArgs, pe.emitValue(arg))
+	}
+
+	// Build C function pointer cast
+	sig := cc.Method.Type().(*types.Signature)
+	retCT := pe.sigReturnCType(sig)
+	var paramCTs []string
+	paramCTs = append(paramCTs, "void*") // self (iface.data)
+	for i := 0; i < sig.Params().Len(); i++ {
+		paramCTs = append(paramCTs, pe.e.cTypeOf(sig.Params().At(i).Type()))
+	}
+
+	castExpr := fmt.Sprintf("((%s(*)(%s))((const hg_iface_tab_t*)%s.itab)->methods[%d])",
+		retCT, strings.Join(paramCTs, ","), iface, methodIdx)
+	callExpr := fmt.Sprintf("%s(%s)", castExpr, strings.Join(callArgs, ","))
+
+	results := sig.Results()
+	if results.Len() == 0 {
+		fmt.Fprintf(b, "    %s;\n", callExpr)
+	} else if results.Len() == 1 {
+		ct := pe.e.cTypeOf(v.Type())
+		fmt.Fprintf(b, "    %s %s = %s;\n", ct, valueName(v), callExpr)
+	} else {
+		// multi-return through struct — emit the struct typedef and store
+		retName := pe.e.invokeRetStructName(sig)
+		pe.e.emitInvokeRetStruct(sig, retName)
+		fmt.Fprintf(b, "    %s %s = %s;\n", retName, valueName(v), callExpr)
+	}
+}
+
+func (pe *pkgEmitter) emitTypeAssert(v *ssa.TypeAssert, b *bytes.Buffer) {
+	ifaceVal := pe.emitValue(v.X)
+	assertedType := v.AssertedType
+
+	// Determine the itab/type pointer expression for the asserted type
+	typeExpr := pe.e.typeDescPtr(assertedType)
+
+	// Determine what type to compare against from the itab
+	// For user-defined types, the itab is hg_iface_tab_t* and .type == &hg_type_XXX
+	// For primitive types, we also go through hg_iface_tab_t* (since we switched from HG_TYPE_XXX)
+	concreteCheck := fmt.Sprintf("((const hg_iface_tab_t*)%s.itab)->type == %s", ifaceVal, typeExpr)
+
+	if v.CommaOk {
+		// Result is a tuple (T, bool)
+		tupleName := pe.e.typeAssertTupleName(assertedType)
+		pe.e.emitTypeAssertTuple(assertedType, tupleName)
+		ct := pe.e.cTypeOf(assertedType)
+		fmt.Fprintf(b, "    %s %s; {\n", tupleName, valueName(v))
+		fmt.Fprintf(b, "        %s.r1 = (%s);\n", valueName(v), concreteCheck)
+		if ct != "" && ct != "void" {
+			fmt.Fprintf(b, "        if (%s.r1) %s.r0 = *(%s*)%s.data; else memset(&%s.r0, 0, sizeof(%s.r0));\n",
+				valueName(v), valueName(v), ct, ifaceVal, valueName(v), valueName(v))
+		}
+		fmt.Fprintf(b, "    }\n")
+	} else {
+		// Panicking assertion
+		ct := pe.e.cTypeOf(assertedType)
+		if typeExpr != "" && typeExpr != "NULL" {
+			typeName := ""
+			if named, ok := assertedType.(*types.Named); ok {
+				typeName = named.Obj().Pkg().Path() + "." + named.Obj().Name()
+			} else {
+				typeName = assertedType.String()
+			}
+			haveExpr := fmt.Sprintf("((const hg_iface_tab_t*)%s.itab)->type->name", ifaceVal)
+			fmt.Fprintf(b, "    if (!(%s)) hg_panic_typeassert(%s, \"%s\");\n",
+				concreteCheck, haveExpr, typeName)
+		}
+		if ct != "" && ct != "void" {
+			fmt.Fprintf(b, "    %s %s = *(%s*)%s.data;\n", ct, valueName(v), ct, ifaceVal)
+		} else {
+			fmt.Fprintf(b, "    /* TypeAssert to void/unknown */\n")
+		}
+	}
+}
+
+// ifaceMethodIndex returns the 0-based index of method m in interface ifaceType
+// sorted alphabetically by method name (Go spec order for interface method sets).
+func ifaceMethodIndex(ifaceType *types.Interface, m *types.Func) int {
+	mset := types.NewMethodSet(ifaceType)
+	// Collect and sort method names
+	var names []string
+	nameToIdx := map[string]int{}
+	for i := 0; i < mset.Len(); i++ {
+		sel := mset.At(i)
+		names = append(names, sel.Obj().Name())
+		nameToIdx[sel.Obj().Name()] = i
+	}
+	// Go method sets are already in alphabetical order per the spec
+	_ = nameToIdx
+	_ = names
+	for i := 0; i < mset.Len(); i++ {
+		if mset.At(i).Obj().Name() == m.Name() {
+			return i
+		}
+	}
+	return 0
+}
+
+func (pe *pkgEmitter) sigReturnCType(sig *types.Signature) string {
+	switch sig.Results().Len() {
+	case 0:
+		return "void"
+	case 1:
+		return pe.e.cTypeOf(sig.Results().At(0).Type())
+	default:
+		return "void*" // multi-return through indirect call: complex, approximate for now
+	}
 }
 
 func (pe *pkgEmitter) emitBuiltin(name string, args []ssa.Value, v *ssa.Call, b *bytes.Buffer) {
@@ -874,41 +1132,79 @@ func (pe *pkgEmitter) formatArgs(args []ssa.Value) string {
 	return strings.Join(parts, ", ")
 }
 
-// m0TypeTag returns the HG_TYPE_* constant for M0 interface boxing.
-func m0TypeTag(t types.Type) string {
+// primitiveItab returns the &hg_itab_TYPE expression for primitive types,
+// or "" for non-primitive types.
+func primitiveItab(t types.Type) string {
 	b, ok := t.Underlying().(*types.Basic)
 	if !ok {
-		return "HG_TYPE_UNKNOWN"
+		return ""
 	}
 	switch b.Kind() {
 	case types.Bool:
-		return "HG_TYPE_BOOL"
+		return "&hg_itab_bool"
 	case types.Int8:
-		return "HG_TYPE_INT8"
+		return "&hg_itab_int8"
 	case types.Int16:
-		return "HG_TYPE_INT16"
+		return "&hg_itab_int16"
 	case types.Int32:
-		return "HG_TYPE_INT32"
+		return "&hg_itab_int32"
 	case types.Int, types.Int64:
-		return "HG_TYPE_INT64"
+		return "&hg_itab_int64"
 	case types.Uint8:
-		return "HG_TYPE_UINT8"
+		return "&hg_itab_uint8"
 	case types.Uint16:
-		return "HG_TYPE_UINT16"
+		return "&hg_itab_uint16"
 	case types.Uint32:
-		return "HG_TYPE_UINT32"
+		return "&hg_itab_uint32"
 	case types.Uint, types.Uint64:
-		return "HG_TYPE_UINT64"
+		return "&hg_itab_uint64"
 	case types.Float32:
-		return "HG_TYPE_FLOAT32"
+		return "&hg_itab_float32"
 	case types.Float64:
-		return "HG_TYPE_FLOAT64"
+		return "&hg_itab_float64"
 	case types.String:
-		return "HG_TYPE_STRING"
+		return "&hg_itab_string"
 	case types.Uintptr:
-		return "HG_TYPE_UINTPTR"
+		return "&hg_itab_uintptr"
 	}
-	return "HG_TYPE_UNKNOWN"
+	return ""
+}
+
+// primitiveTypeDesc returns the &hg_type_TYPE expression for primitive types.
+func primitiveTypeDesc(t types.Type) string {
+	b, ok := t.Underlying().(*types.Basic)
+	if !ok {
+		return ""
+	}
+	switch b.Kind() {
+	case types.Bool:
+		return "&hg_type_bool"
+	case types.Int8:
+		return "&hg_type_int8"
+	case types.Int16:
+		return "&hg_type_int16"
+	case types.Int32:
+		return "&hg_type_int32"
+	case types.Int, types.Int64:
+		return "&hg_type_int64"
+	case types.Uint8:
+		return "&hg_type_uint8"
+	case types.Uint16:
+		return "&hg_type_uint16"
+	case types.Uint32:
+		return "&hg_type_uint32"
+	case types.Uint, types.Uint64:
+		return "&hg_type_uint64"
+	case types.Float32:
+		return "&hg_type_float32"
+	case types.Float64:
+		return "&hg_type_float64"
+	case types.String:
+		return "&hg_type_string"
+	case types.Uintptr:
+		return "&hg_type_uintptr"
+	}
+	return ""
 }
 
 // ── type predicates ───────────────────────────────────────────────────────────
@@ -947,6 +1243,32 @@ func isIfaceSlice(t types.Type) bool {
 	return ok
 }
 
+// traceConcreteType follows the SSA def-use chain backward through
+// MakeInterface and ChangeInterface nodes to find the original concrete type.
+// Returns nil if the concrete type cannot be determined statically.
+func traceConcreteType(v ssa.Value) types.Type {
+	seen := map[ssa.Value]bool{}
+	for {
+		if seen[v] {
+			return nil
+		}
+		seen[v] = true
+		switch x := v.(type) {
+		case *ssa.MakeInterface:
+			return x.X.Type()
+		case *ssa.ChangeInterface:
+			v = x.X
+		default:
+			return nil
+		}
+	}
+}
+
+func isNilConst(v ssa.Value) bool {
+	c, ok := v.(*ssa.Const)
+	return ok && c.Value == nil
+}
+
 func isByteSlice(t types.Type) bool {
 	sl, ok := t.(*types.Slice)
 	if !ok {
@@ -970,6 +1292,39 @@ func intSuffix(k types.BasicKind) string {
 	return ""
 }
 
+// ── math package mapping ──────────────────────────────────────────────────────
+
+// mathMapping maps "math.FuncName" → C math.h function name.
+var mathMapping = map[string]string{
+	"math.Sqrt":  "sqrt",
+	"math.Abs":   "fabs",
+	"math.Ceil":  "ceil",
+	"math.Floor": "floor",
+	"math.Round": "round",
+	"math.Trunc": "trunc",
+	"math.Sin":   "sin",
+	"math.Cos":   "cos",
+	"math.Tan":   "tan",
+	"math.Asin":  "asin",
+	"math.Acos":  "acos",
+	"math.Atan":  "atan",
+	"math.Atan2": "atan2",
+	"math.Exp":   "exp",
+	"math.Exp2":  "exp2",
+	"math.Log":   "log",
+	"math.Log2":  "log2",
+	"math.Log10": "log10",
+	"math.Pow":   "pow",
+	"math.Hypot": "hypot",
+	"math.Mod":   "fmod",
+	"math.Max":   "fmax",
+	"math.Min":   "fmin",
+	"math.IsNaN": "isnan",
+	"math.IsInf": "isinf",
+	"math.Inf":   "hg_math_inf",
+	"math.NaN":   "hg_math_nan",
+}
+
 // ── string utilities ──────────────────────────────────────────────────────────
 
 func escapeCStr(s string) string {
@@ -991,6 +1346,102 @@ func escapeCStr(s string) string {
 		}
 	}
 	return sb.String()
+}
+
+// ── M2: closures and defer ────────────────────────────────────────────────────
+
+func (pe *pkgEmitter) emitMakeClosure(v *ssa.MakeClosure, b *bytes.Buffer) {
+	fn := v.Fn.(*ssa.Function)
+	envTypeName := pe.emitClosureEnv(fn)
+	fnCName := pe.prefix() + sanitizeName(fn.Name())
+
+	if envTypeName == "" {
+		// No free vars: just wrap the function pointer
+		fmt.Fprintf(b, "    hg_func_t %s = {(void*)%s, NULL};\n", valueName(v), fnCName)
+		return
+	}
+
+	// Allocate env and fill captured variables
+	fmt.Fprintf(b, "    hg_func_t %s; { %s *_mc_env = (%s*)hg_alloc(sizeof(%s));\n",
+		valueName(v), envTypeName, envTypeName, envTypeName)
+	for i, fv := range fn.FreeVars {
+		capVal := pe.emitValue(v.Bindings[i])
+		fmt.Fprintf(b, "    _mc_env->%s = %s;\n", sanitizeName(fv.Name()), capVal)
+	}
+	fmt.Fprintf(b, "    %s.fn = (void*)%s; %s.env = _mc_env; }\n",
+		valueName(v), fnCName, valueName(v))
+}
+
+// deferCounter tracks unique IDs for defer trampoline functions per package.
+// We store it in mapFuncs with a special prefix.
+func (pe *pkgEmitter) nextDeferID() string {
+	key := "_hg_defer_counter"
+	pe.e.mapFuncs[key] = true
+	// count how many _hg_defertramp_ entries exist
+	n := 0
+	for k := range pe.e.mapFuncs {
+		if strings.HasPrefix(k, "_hg_defertramp_") {
+			n++
+		}
+	}
+	return fmt.Sprintf("%d", n)
+}
+
+func (pe *pkgEmitter) emitDefer(v *ssa.Defer, b *bytes.Buffer) {
+	callFn := ""
+	switch fn := v.Call.Value.(type) {
+	case *ssa.Function:
+		callFn = pe.prefix() + sanitizeName(fn.Name())
+	case *ssa.Builtin:
+		fmt.Fprintf(b, "    /* defer builtin %s: M2 stub */\n", fn.Name())
+		return
+	}
+
+	id := pe.nextDeferID()
+	argStructName := "_hg_defer_arg_" + id + "_t"
+	deferFnName := "_hg_defertramp_" + id
+
+	// declare arg struct type in header
+	fmt.Fprintf(pe.e.hdrbuf, "typedef struct {\n")
+	if callFn == "" && v.Call.Value != nil {
+		fmt.Fprintf(pe.e.hdrbuf, "    hg_func_t _fn;\n")
+	}
+	for i, arg := range v.Call.Args {
+		ct := pe.e.cTypeOf(arg.Type())
+		fmt.Fprintf(pe.e.hdrbuf, "    %s _a%d;\n", ct, i)
+	}
+	fmt.Fprintf(pe.e.hdrbuf, "} %s;\n", argStructName)
+
+	// emit trampoline function in header
+	pe.e.mapFuncs[deferFnName] = true
+	fmt.Fprintf(pe.e.hdrbuf, "static void %s(void *_arg) {\n", deferFnName)
+	fmt.Fprintf(pe.e.hdrbuf, "    %s *_da = (%s*)_arg;\n", argStructName, argStructName)
+	if callFn != "" {
+		var argExprs []string
+		for i := range v.Call.Args {
+			argExprs = append(argExprs, fmt.Sprintf("_da->_a%d", i))
+		}
+		fmt.Fprintf(pe.e.hdrbuf, "    %s(%s);\n", callFn, strings.Join(argExprs, ", "))
+	} else if v.Call.Value != nil {
+		var argExprs []string
+		argExprs = append(argExprs, "_da->_fn.env")
+		for i := range v.Call.Args {
+			argExprs = append(argExprs, fmt.Sprintf("_da->_a%d", i))
+		}
+		fmt.Fprintf(pe.e.hdrbuf, "    ((void(*)(void*))_da->_fn.fn)(%s);\n", strings.Join(argExprs, ", "))
+	}
+	fmt.Fprintf(pe.e.hdrbuf, "}\n")
+
+	// fill arg struct and push onto defer stack
+	fmt.Fprintf(b, "    { %s *_da = (%s*)hg_alloc(sizeof(%s));\n", argStructName, argStructName, argStructName)
+	if callFn == "" && v.Call.Value != nil {
+		fmt.Fprintf(b, "    _da->_fn = %s;\n", pe.emitValue(v.Call.Value))
+	}
+	for i, arg := range v.Call.Args {
+		fmt.Fprintf(b, "    _da->_a%d = %s;\n", i, pe.emitValue(arg))
+	}
+	fmt.Fprintf(b, "    hg_defer_t *_df = (hg_defer_t*)hg_alloc(sizeof(hg_defer_t)); _df->fn = %s; _df->arg = _da; _df->next = _hg_defer_head; _hg_defer_head = _df; }\n",
+		deferFnName)
 }
 
 // ── M1: map and range ─────────────────────────────────────────────────────────

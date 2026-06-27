@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"golang.org/x/tools/go/ssa"
+	"golang.org/x/tools/go/ssa/ssautil"
 
 	"github.com/tamnd/hagane/frontend"
 )
@@ -27,6 +28,7 @@ type Emitter struct {
 	mapTypes   map[string]bool
 	nextTypes  map[string]bool // Next result tuple typedefs already emitted
 	mapFuncs   map[string]bool // hash/eq helper function names already emitted
+	ifacePairs map[string]ifacePair // (concrete, iface) pairs for M3 itab emission
 }
 
 // rtSliceTypes lists slice typedefs already defined in hagane_rt.h so we don't re-emit them.
@@ -62,6 +64,7 @@ func New(prog *frontend.Program) *Emitter {
 		mapTypes:   make(map[string]bool),
 		nextTypes:  make(map[string]bool),
 		mapFuncs:   make(map[string]bool),
+		ifacePairs: make(map[string]ifacePair),
 	}
 }
 
@@ -116,12 +119,12 @@ func (e *Emitter) emitPkg(pkg *ssa.Package) ([]byte, error) {
 	e.mapTypes   = make(map[string]bool)
 	e.nextTypes  = make(map[string]bool)
 	e.mapFuncs   = make(map[string]bool)
+	e.ifacePairs = make(map[string]ifacePair)
 
-	// collect and sort functions for deterministic output
+	// collect all functions in this package (including methods) via AllFunctions
 	var fns []*ssa.Function
-	for name, mem := range pkg.Members {
-		_ = name
-		if fn, ok := mem.(*ssa.Function); ok {
+	for fn := range ssautil.AllFunctions(e.prog.SSA) {
+		if fn.Package() == pkg && fn.Blocks != nil {
 			fns = append(fns, fn)
 		}
 	}
@@ -129,10 +132,15 @@ func (e *Emitter) emitPkg(pkg *ssa.Package) ([]byte, error) {
 		return fns[i].Name() < fns[j].Name()
 	})
 
-	// also collect anonymous/closure functions
+	// expand to include anonymous functions (closures)
 	var allFns []*ssa.Function
 	var collectAnon func(fn *ssa.Function)
+	anonSeen := map[*ssa.Function]bool{}
 	collectAnon = func(fn *ssa.Function) {
+		if anonSeen[fn] {
+			return
+		}
+		anonSeen[fn] = true
 		allFns = append(allFns, fn)
 		for _, anon := range fn.AnonFuncs {
 			collectAnon(anon)
@@ -146,6 +154,26 @@ func (e *Emitter) emitPkg(pkg *ssa.Package) ([]byte, error) {
 	pe := &pkgEmitter{e: e, pkg: pkg}
 	pe.emitHeader()
 
+	// emit prototypes for anonymous functions (not in pkg.Members)
+	for _, fn := range allFns {
+		if fn.Blocks == nil {
+			continue
+		}
+		if _, inMembers := pkg.Members[fn.Name()]; inMembers {
+			continue // top-level already emitted by emitHeader
+		}
+		// anon func prototype
+		if len(fn.FreeVars) > 0 {
+			// env struct must be emitted before the prototype
+			pe.emitClosureEnv(fn)
+		}
+		if fn.Signature.Results().Len() > 1 {
+			decl := retStructDecl(e, pe.prefix(), methodCBaseName(fn), fn.Signature.Results())
+			fmt.Fprintf(e.hdrbuf, "%s\n", decl)
+		}
+		fmt.Fprintf(e.hdrbuf, "%s;\n", pe.funcSignature(fn))
+	}
+
 	// emit function bodies
 	for _, fn := range allFns {
 		if fn.Blocks == nil {
@@ -153,6 +181,9 @@ func (e *Emitter) emitPkg(pkg *ssa.Package) ([]byte, error) {
 		}
 		pe.emitFunc(fn)
 	}
+
+	// emit GoType globals and itab globals for M3 interface dispatch
+	e.emitIfaceDecls()
 
 	// assemble: preamble + header + body
 	var out bytes.Buffer

@@ -66,6 +66,7 @@ func newBuildCmd() *cobra.Command {
 
 			argv := append([]string{"-O2", "-std=c11", "-o", out}, cFiles...)
 			argv = append(argv, cflags...)
+			argv = append(argv, "-lm") // for sqrt, pow, etc.
 			c := exec.Command(cc, argv...)
 			c.Stdout = os.Stdout
 			c.Stderr = os.Stderr

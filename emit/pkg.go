@@ -94,7 +94,7 @@ func (pe *pkgEmitter) emitHeader() {
 	for _, name := range fnNames {
 		fn := pe.pkg.Members[name].(*ssa.Function)
 		if fn.Signature.Results().Len() > 1 {
-			decl := retStructDecl(pe.e, pe.prefix(), sanitizeName(fn.Name()), fn.Signature.Results())
+			decl := retStructDecl(pe.e, pe.prefix(), methodCBaseName(fn), fn.Signature.Results())
 			fmt.Fprintf(h, "%s\n", decl)
 		}
 	}
@@ -106,11 +106,33 @@ func (pe *pkgEmitter) emitHeader() {
 	}
 }
 
+// methodCBaseName returns the C function base name for fn, including receiver type
+// for methods so that English.Greet and Spanish.Greet don't collide.
+func methodCBaseName(fn *ssa.Function) string {
+	recv := fn.Signature.Recv()
+	if recv == nil {
+		return sanitizeName(fn.Name())
+	}
+	// extract the receiver type name (dereference pointer receiver)
+	t := recv.Type()
+	if ptr, ok := t.(*types.Pointer); ok {
+		t = ptr.Elem()
+	}
+	if named, ok := t.(*types.Named); ok {
+		return sanitizeName(named.Obj().Name()) + "_" + sanitizeName(fn.Name())
+	}
+	return sanitizeName(fn.Name())
+}
+
 func (pe *pkgEmitter) funcSignature(fn *ssa.Function) string {
-	cname := pe.prefix() + sanitizeName(fn.Name())
+	cname := pe.prefix() + methodCBaseName(fn)
 	retType := pe.returnCType(fn)
 
 	var params []string
+	// closures get an extra env pointer as first parameter
+	if len(fn.FreeVars) > 0 {
+		params = append(params, "void *_hg_env")
+	}
 	for i, p := range fn.Params {
 		ct := pe.e.cTypeOf(p.Type())
 		pname := paramName(p, i)
@@ -120,6 +142,31 @@ func (pe *pkgEmitter) funcSignature(fn *ssa.Function) string {
 		params = []string{"void"}
 	}
 	return fmt.Sprintf("%s %s(%s)", retType, cname, strings.Join(params, ", "))
+}
+
+// closureEnvTypeName returns the C env struct type name for an anon func.
+func (pe *pkgEmitter) closureEnvTypeName(fn *ssa.Function) string {
+	return pe.prefix() + sanitizeName(fn.Name()) + "_env_t"
+}
+
+// emitClosureEnv emits the env struct typedef for fn (if it has free vars)
+// into the header buffer, and returns the type name.
+func (pe *pkgEmitter) emitClosureEnv(fn *ssa.Function) string {
+	if len(fn.FreeVars) == 0 {
+		return ""
+	}
+	name := pe.closureEnvTypeName(fn)
+	if pe.e.mapFuncs[name] { // reuse mapFuncs as general "already emitted" set
+		return name
+	}
+	pe.e.mapFuncs[name] = true
+	fmt.Fprintf(pe.e.hdrbuf, "typedef struct {\n")
+	for _, fv := range fn.FreeVars {
+		ct := pe.e.cTypeOf(fv.Type())
+		fmt.Fprintf(pe.e.hdrbuf, "    %s %s;\n", ct, sanitizeName(fv.Name()))
+	}
+	fmt.Fprintf(pe.e.hdrbuf, "} %s;\n", name)
+	return name
 }
 
 func (pe *pkgEmitter) returnCType(fn *ssa.Function) string {
@@ -140,7 +187,21 @@ func (pe *pkgEmitter) emitFunc(fn *ssa.Function) {
 
 	pe.emitNeededSliceTypes(fn)
 
+	// emit env struct typedef for closures (into header, before signature)
+	envTypeName := pe.emitClosureEnv(fn)
+
 	fmt.Fprintf(b, "%s {\n", pe.funcSignature(fn))
+
+	// unpack env pointer into typed struct for closures
+	if envTypeName != "" {
+		fmt.Fprintf(b, "    %s *_env = (%s*)_hg_env;\n", envTypeName, envTypeName)
+	}
+
+	// defer linked-list head if function has any Defer instructions
+	if pe.fnHasDefers(fn) {
+		fmt.Fprintf(b, "    hg_defer_t *_hg_defer_head = NULL;\n")
+	}
+
 	pe.emitLocalDecls(fn, b)
 	pe.emitRangeDecls(fn, b)
 
@@ -209,6 +270,17 @@ func (pe *pkgEmitter) emitBlock(fn *ssa.Function, blk *ssa.BasicBlock, b *bytes.
 	}
 }
 
+func (pe *pkgEmitter) fnHasDefers(fn *ssa.Function) bool {
+	for _, blk := range fn.Blocks {
+		for _, instr := range blk.Instrs {
+			if _, ok := instr.(*ssa.Defer); ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func paramName(p *ssa.Parameter, i int) string {
 	n := p.Name()
 	if n == "" || n == "_" {
@@ -226,7 +298,10 @@ func valueName(v ssa.Value) string {
 }
 
 func sanitizeName(n string) string {
-	n = strings.NewReplacer("$", "_", ".", "_", "-", "_").Replace(n)
+	// Handle method names like "(Point).Distance" → "Point_Distance"
+	// and "(T).Method" patterns
+	n = strings.TrimPrefix(n, "(")
+	n = strings.NewReplacer(").", "_", ")", "_", "$", "_", ".", "_", "-", "_", "*", "ptr").Replace(n)
 	switch n {
 	case "default", "return", "if", "else", "for", "while", "do",
 		"int", "long", "short", "char", "float", "double", "void",
