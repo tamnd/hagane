@@ -1,6 +1,10 @@
 #include "hagane_rt.h"
 #include <stdarg.h>
 #include <time.h>
+#ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
+#endif
 
 /* ── memory ──────────────────────────────────────────────────────────────── */
 
@@ -126,6 +130,11 @@ void hg_memmove(void *dst, const void *src, size_t n) {
 void hg_runtime_init(void) {
     /* seed for map iteration order randomization */
     srand((unsigned)(time(NULL) ^ (uintptr_t)&hg_runtime_init));
+#ifdef _WIN32
+    /* Go's runtime sets stdout/stderr to binary mode; match that behavior. */
+    _setmode(_fileno(stdout), _O_BINARY);
+    _setmode(_fileno(stderr), _O_BINARY);
+#endif
 }
 
 void hg_panic_typeassert(const char *have, const char *want) {
