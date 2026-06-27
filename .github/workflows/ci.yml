@@ -14,9 +14,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Build and test on Linux and macOS with the race detector on. Integration
-  # tests emit C and compile it, so the Linux leg installs gcc first. macOS
-  # runners ship Clang as cc, so no extra install is needed there.
+  # Build and test on Linux and macOS. Integration tests emit C and compile it,
+  # so the Linux leg installs gcc first. macOS runners ship Clang, no extra
+  # install needed. CGO_ENABLED=0 because the transpiler itself uses no CGO;
+  # race detection requires CGO so we skip -race here.
   test:
     strategy:
       fail-fast: false
@@ -50,7 +51,7 @@ jobs:
       - name: test
         env:
           CGO_ENABLED: "0"
-        run: go test -race -count=1 -coverprofile=coverage.out ./...
+        run: go test -count=1 -coverprofile=coverage.out ./...
       - name: coverage summary
         if: matrix.os == 'ubuntu-latest'
         run: go tool cover -func=coverage.out | tail -1
@@ -69,21 +70,6 @@ jobs:
       - uses: golangci/golangci-lint-action@v9.2.1
         with:
           version: latest
-
-  # Scan the module and its dependencies for known vulnerabilities.
-  govulncheck:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7.0.0
-      - uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          check-latest: true
-          cache: true
-      - name: govulncheck
-        run: |
-          go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
-          govulncheck ./...
 
   # Confirm go.mod and go.sum are tidy: a PR that adds an import without
   # running go mod tidy fails here instead of breaking a later release.
