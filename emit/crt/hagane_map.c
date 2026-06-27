@@ -100,8 +100,9 @@ void hg_map_set(hg_map_t *m, const void *key, const void *val) {
     int64_t  i = (int64_t)(h & (uint32_t)mask);
 
     /* we'll robin-hood insert; carry a (key,val,psl) tuple */
-    uint8_t *carry_key = (uint8_t*)alloca(m->key_size);
-    uint8_t *carry_val = (uint8_t*)alloca(m->val_size);
+    uint8_t *carry_key = (uint8_t*)malloc(m->key_size);
+    uint8_t *carry_val = (uint8_t*)malloc(m->val_size);
+    if (!carry_key || !carry_val) abort();
     memcpy(carry_key, key, m->key_size);
     memcpy(carry_val, val, m->val_size);
     uint8_t carry_psl = 1;
@@ -109,42 +110,38 @@ void hg_map_set(hg_map_t *m, const void *key, const void *val) {
     for (;;) {
         uint8_t sp = slot_psl(m, i);
         if (sp == SLOT_EMPTY || sp == SLOT_TOMBSTONE) {
-            /* empty slot: place here */
             slot_at(m, i)[0] = carry_psl;
             memcpy(slot_key(m, i), carry_key, m->key_size);
             memcpy(slot_val(m, i), carry_val, m->val_size);
             m->count++;
-            return;
+            goto done;
         }
-        /* check for existing key */
         if (m->key_eq(slot_key(m, i), carry_key)) {
-            /* update value */
             memcpy(slot_val(m, i), carry_val, m->val_size);
-            return;
+            goto done;
         }
-        /* robin-hood: steal from the rich */
         if (sp < carry_psl) {
-            /* swap carry with current slot */
             uint8_t tmp_psl = sp;
             sp = carry_psl; carry_psl = tmp_psl;
-            /* swap key */
             uint8_t tmp_buf[256];
             if (m->key_size <= sizeof(tmp_buf)) {
-                memcpy(tmp_buf,         slot_key(m,i), m->key_size);
-                memcpy(slot_key(m,i),  carry_key,      m->key_size);
-                memcpy(carry_key,       tmp_buf,        m->key_size);
+                memcpy(tmp_buf,        slot_key(m,i), m->key_size);
+                memcpy(slot_key(m,i), carry_key,      m->key_size);
+                memcpy(carry_key,      tmp_buf,        m->key_size);
             }
-            /* swap val */
             if (m->val_size <= sizeof(tmp_buf)) {
-                memcpy(tmp_buf,         slot_val(m,i), m->val_size);
-                memcpy(slot_val(m,i),  carry_val,      m->val_size);
-                memcpy(carry_val,       tmp_buf,        m->val_size);
+                memcpy(tmp_buf,        slot_val(m,i), m->val_size);
+                memcpy(slot_val(m,i), carry_val,      m->val_size);
+                memcpy(carry_val,      tmp_buf,        m->val_size);
             }
             slot_at(m, i)[0] = sp;
         }
         i = (i + 1) & (m->cap - 1);
         carry_psl++;
     }
+done:
+    free(carry_key);
+    free(carry_val);
 }
 
 void hg_map_delete(hg_map_t *m, const void *key) {
