@@ -292,6 +292,9 @@ func (e *Emitter) runEmitPkg(pkg *ssa.Package) error {
 	// emit forward declarations into hdrbuf
 	pe := &pkgEmitter{e: e, pkg: pkg}
 	pe.emitHeader()
+	// emit global variable definitions into the body buffer so they appear
+	// exactly once per compilation unit (the .c file), not in the shared header.
+	pe.emitGlobalDefs()
 
 	// Build the set of C names already declared by emitHeader (pkg.Members top-level funcs).
 	memberCnames := map[string]bool{}

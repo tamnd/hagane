@@ -48,7 +48,7 @@ func (pe *pkgEmitter) emitHeader() {
 			elemCT = ct
 		}
 		cname := pe.prefix() + sanitizeName(g.Name())
-		fmt.Fprintf(h, "%s %s;\n", elemCT, cname)
+		fmt.Fprintf(h, "extern %s %s;\n", elemCT, cname)
 	}
 
 	// Collect named types in sorted order for deterministic output.
@@ -222,6 +222,35 @@ func (pe *pkgEmitter) returnCType(fn *ssa.Function) string {
 		return pe.e.cTypeOf(results.At(0).Type())
 	default:
 		return retStructName(pe.prefix(), sanitizeName(fn.Name()))
+	}
+}
+
+// emitGlobalDefs emits global variable definitions (T name;) into the body buffer.
+// The header only carries extern declarations; this function provides the single
+// definition that the linker requires, placed in the .c file so it appears once.
+func (pe *pkgEmitter) emitGlobalDefs() {
+	b := pe.e.buf
+	var names []string
+	for name := range pe.pkg.Members {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		g, ok := pe.pkg.Members[name].(*ssa.Global)
+		if !ok {
+			continue
+		}
+		var elemCT string
+		if ptr, ok := g.Type().Underlying().(*types.Pointer); ok {
+			elemCT = pe.e.cTypeOf(ptr.Elem())
+		} else {
+			elemCT = pe.e.cTypeOf(g.Type())
+		}
+		cname := pe.prefix() + sanitizeName(g.Name())
+		fmt.Fprintf(b, "%s %s;\n", elemCT, cname)
+	}
+	if len(names) > 0 {
+		fmt.Fprintf(b, "\n")
 	}
 }
 
