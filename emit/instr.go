@@ -1411,7 +1411,36 @@ func (pe *pkgEmitter) emitDefer(v *ssa.Defer, b *bytes.Buffer) {
 	callFn := ""
 	switch fn := v.Call.Value.(type) {
 	case *ssa.Function:
-		callFn = pe.prefix() + sanitizeName(fn.Name())
+		if fn.Package() != nil {
+			pkg := fn.Package().Pkg.Path()
+			switch pkg {
+			case "fmt":
+				// map to runtime shim
+				switch fn.Name() {
+				case "Println":
+					callFn = "hg_fmt_println"
+				case "Print":
+					callFn = "hg_fmt_print"
+				case "Printf":
+					callFn = "hg_fmt_printf"
+				default:
+					fmt.Fprintf(b, "    /* defer fmt.%s: unimplemented */\n", fn.Name())
+					return
+				}
+			default:
+				if skipPkg(fn.Package()) {
+					fmt.Fprintf(b, "    /* defer call to %s.%s: skipped */\n", pkg, fn.Name())
+					return
+				}
+				if fn.Package() == pe.pkg {
+					callFn = pe.prefix() + methodCBaseName(fn)
+				} else {
+					callFn = pkgCPrefix(pkg) + methodCBaseName(fn)
+				}
+			}
+		} else {
+			callFn = pe.prefix() + sanitizeName(fn.Name())
+		}
 	case *ssa.Builtin:
 		fmt.Fprintf(b, "    /* defer builtin %s: M2 stub */\n", fn.Name())
 		return
