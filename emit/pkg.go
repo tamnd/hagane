@@ -60,6 +60,20 @@ func (pe *pkgEmitter) emitHeader() {
 	}
 	sort.Strings(typeNames)
 
+	// Forward-declare all struct types first so self-referential or mutually
+	// recursive structs can reference each other in their field lists.
+	for _, name := range typeNames {
+		tp := pe.pkg.Members[name].(*ssa.Type)
+		named, ok := tp.Type().(*types.Named)
+		if !ok {
+			continue
+		}
+		if _, ok := named.Underlying().(*types.Struct); ok {
+			cname := pe.e.cTypeNamed(named)
+			fmt.Fprintf(h, "typedef struct %s %s;\n", cname, cname)
+		}
+	}
+
 	for _, name := range typeNames {
 		tp := pe.pkg.Members[name].(*ssa.Type)
 		named, ok := tp.Type().(*types.Named)
@@ -69,13 +83,14 @@ func (pe *pkgEmitter) emitHeader() {
 		cname := pe.e.cTypeNamed(named)
 		switch st := named.Underlying().(type) {
 		case *types.Struct:
-			fmt.Fprintf(h, "typedef struct {\n")
+			// Use the struct tag (same name as typedef) so forward declarations work.
+			fmt.Fprintf(h, "struct %s {\n", cname)
 			for i := 0; i < st.NumFields(); i++ {
 				f := st.Field(i)
 				ft := pe.e.cTypeOf(f.Type())
 				fmt.Fprintf(h, "    %s %s;\n", ft, f.Name())
 			}
-			fmt.Fprintf(h, "} %s;\n", cname)
+			fmt.Fprintf(h, "};\n")
 		default:
 			// Named alias over a non-struct type (array, basic, etc.).
 			// cTypeInner will register any needed array typedefs in hdrbuf.

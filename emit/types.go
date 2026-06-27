@@ -12,8 +12,9 @@ func (e *Emitter) cTypeInner(t types.Type) string {
 		return basicCType(t.Kind())
 
 	case *types.Pointer:
-		elem := e.cTypeInner(t.Elem().Underlying())
-		return elem + "*"
+		// Use cTypeOf so Named types (structs) keep their names rather than
+		// collapsing to hg_anon_struct_t via Underlying().
+		return e.cTypeOf(t.Elem()) + "*"
 
 	case *types.Slice:
 		elem := e.cTypeInner(t.Elem().Underlying())
@@ -77,12 +78,8 @@ func (e *Emitter) cTypeOf(t types.Type) string {
 	case *types.Named:
 		return e.cTypeNamed(t)
 	case *types.Pointer:
-		switch elem := t.Elem().(type) {
-		case *types.Named:
-			return e.cTypeNamed(elem) + "*"
-		default:
-			return e.cTypeInner(t.Elem().Underlying()) + "*"
-		}
+		// Recurse through cTypeOf to preserve Named wrappers at every depth.
+		return e.cTypeOf(t.Elem()) + "*"
 	default:
 		return e.cTypeInner(t.Underlying())
 	}

@@ -436,6 +436,19 @@ func (pe *pkgEmitter) emitCall(v *ssa.Call, b *bytes.Buffer) {
 				pe.emitFmtCall(fn.Name(), cc.Args, b)
 				return
 			}
+			// errors.New → runtime shim (must check before skipPkg)
+			if fn.Package().Pkg.Path() == "errors" {
+				switch fn.Name() {
+				case "New":
+					ct := pe.e.cTypeOf(v.Type())
+					args := pe.formatArgs(cc.Args)
+					fmt.Fprintf(b, "    %s %s = hg_errors_New(%s);\n", ct, valueName(v), args)
+					return
+				default:
+					fmt.Fprintf(b, "    /* call to errors.%s skipped */\n", fn.Name())
+					return
+				}
+			}
 			// math package → C <math.h> (must check before skipPkg)
 			if mathCFn, ok := mathMapping[fn.Package().Pkg.Path()+"."+fn.Name()]; ok {
 				args := pe.formatArgs(cc.Args)
