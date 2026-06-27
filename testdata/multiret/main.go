@@ -21,5 +21,5 @@ func minmax(s []int) (int, int) {
 func main() {
 	s := []int{3, 1, 4, 1, 5, 9, 2, 6, 5, 3}
 	lo, hi := minmax(s)
-	fmt.Println(lo, hi)
+	fmt.Printf("min=%d max=%d\n", lo, hi)
 }

@@ -48,27 +48,37 @@ func (pe *pkgEmitter) emitHeader() {
 		fmt.Fprintf(h, "%s %s;\n", elemCT, cname)
 	}
 
-	for _, mem := range pe.pkg.Members {
-		tp, ok := mem.(*ssa.Type)
-		if !ok {
-			continue
+	// Collect named types in sorted order for deterministic output.
+	var typeNames []string
+	for name, mem := range pe.pkg.Members {
+		if _, ok := mem.(*ssa.Type); ok {
+			typeNames = append(typeNames, name)
 		}
+	}
+	sort.Strings(typeNames)
+
+	for _, name := range typeNames {
+		tp := pe.pkg.Members[name].(*ssa.Type)
 		named, ok := tp.Type().(*types.Named)
 		if !ok {
 			continue
 		}
-		st, ok := named.Underlying().(*types.Struct)
-		if !ok {
-			continue
-		}
 		cname := pe.e.cTypeNamed(named)
-		fmt.Fprintf(h, "typedef struct {\n")
-		for i := 0; i < st.NumFields(); i++ {
-			f := st.Field(i)
-			ft := pe.e.cTypeOf(f.Type())
-			fmt.Fprintf(h, "    %s %s;\n", ft, f.Name())
+		switch st := named.Underlying().(type) {
+		case *types.Struct:
+			fmt.Fprintf(h, "typedef struct {\n")
+			for i := 0; i < st.NumFields(); i++ {
+				f := st.Field(i)
+				ft := pe.e.cTypeOf(f.Type())
+				fmt.Fprintf(h, "    %s %s;\n", ft, f.Name())
+			}
+			fmt.Fprintf(h, "} %s;\n", cname)
+		default:
+			// Named alias over a non-struct type (array, basic, etc.).
+			// cTypeInner will register any needed array typedefs in hdrbuf.
+			underlying := pe.e.cTypeInner(named.Underlying())
+			fmt.Fprintf(h, "typedef %s %s;\n", underlying, cname)
 		}
-		fmt.Fprintf(h, "} %s;\n", cname)
 	}
 
 	// Collect function members in sorted order for deterministic output.
