@@ -139,6 +139,12 @@ func basicCType(k types.BasicKind) string {
 }
 
 func sliceTypeName(elemCType string) string {
+	// Primitive C types already ending in _t (int8_t, uint64_t, uintptr_t…)
+	// don't get another _t appended; hg_* types (hg_iface_t, hg_string_t)
+	// do, because that's what the runtime header defines.
+	if strings.HasSuffix(elemCType, "_t") && !strings.HasPrefix(elemCType, "hg_") {
+		return "hg_slice_" + mangle(elemCType)
+	}
 	return "hg_slice_" + mangle(elemCType) + "_t"
 }
 

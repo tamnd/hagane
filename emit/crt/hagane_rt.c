@@ -73,6 +73,49 @@ void* hg_growslice_raw(size_t elem_size, void *old_ptr, int64_t len, int64_t *ca
     return p;
 }
 
+/* ── slice helpers (internal; generated code emits inline instead) ───────── */
+
+static hg_slice_uint8_t hg_append_one(hg_slice_uint8_t s, const void *elem, size_t elem_size) {
+    if (s.len >= s.cap) {
+        int64_t new_cap = s.cap * 2;
+        if (new_cap < s.len + 1) new_cap = s.len + 1;
+        if (new_cap < 4)         new_cap = 4;
+        size_t old_bytes = (size_t)s.cap * elem_size;
+        size_t new_bytes = (size_t)new_cap * elem_size;
+        uint8_t *p = (uint8_t*)realloc(s.ptr, new_bytes);
+        if (!p) { fprintf(stderr, "hagane: out of memory\n"); abort(); }
+        if (new_bytes > old_bytes) memset(p + old_bytes, 0, new_bytes - old_bytes);
+        s.ptr = p; s.cap = new_cap;
+    }
+    memcpy(s.ptr + (size_t)s.len * elem_size, elem, elem_size);
+    s.len++;
+    return s;
+}
+
+static hg_slice_uint8_t hg_append_slice(hg_slice_uint8_t dst, hg_slice_uint8_t src, size_t elem_size) {
+    if (src.len == 0) return dst;
+    int64_t need = dst.len + src.len;
+    if (need > dst.cap) {
+        int64_t new_cap = dst.cap * 2;
+        if (new_cap < need) new_cap = need;
+        size_t old_bytes = (size_t)dst.cap * elem_size;
+        size_t new_bytes = (size_t)new_cap * elem_size;
+        uint8_t *p = (uint8_t*)realloc(dst.ptr, new_bytes);
+        if (!p) { fprintf(stderr, "hagane: out of memory\n"); abort(); }
+        if (new_bytes > old_bytes) memset(p + old_bytes, 0, new_bytes - old_bytes);
+        dst.ptr = p; dst.cap = new_cap;
+    }
+    memcpy(dst.ptr + (size_t)dst.len * elem_size, src.ptr, (size_t)src.len * elem_size);
+    dst.len += src.len;
+    return dst;
+}
+
+static int64_t hg_copy_slice(hg_slice_uint8_t dst, hg_slice_uint8_t src, size_t elem_size) {
+    int64_t n = dst.len < src.len ? dst.len : src.len;
+    if (n > 0) memmove(dst.ptr, src.ptr, (size_t)n * elem_size);
+    return n;
+}
+
 /* ── misc ────────────────────────────────────────────────────────────────── */
 
 void hg_memmove(void *dst, const void *src, size_t n) {
@@ -123,8 +166,72 @@ void hg_fmt_print(hg_slice_hg_iface_t_t args) {
 }
 
 void hg_fmt_printf(hg_string_t fmt_str, hg_slice_hg_iface_t_t args) {
-    /* M0: best-effort: treat fmt_str as a C format string and walk args */
-    (void)fmt_str; (void)args;
-    /* TODO: proper Go-to-C fmt parsing */
-    printf("%.*s", (int)fmt_str.len, fmt_str.ptr ? fmt_str.ptr : "");
+    const char *p   = fmt_str.ptr;
+    const char *end = p + fmt_str.len;
+    int64_t ai = 0;
+    while (p < end) {
+        if (*p != '%') { putchar(*p++); continue; }
+        p++;
+        if (p >= end) break;
+        if (*p == '%') { putchar('%'); p++; continue; }
+        /* skip flags */
+        while (p < end && (*p=='-'||*p=='+'||*p==' '||*p=='#'||*p=='0')) p++;
+        /* skip width */
+        while (p < end && *p>='0' && *p<='9') p++;
+        /* skip precision */
+        if (p < end && *p == '.') { p++; while (p < end && *p>='0' && *p<='9') p++; }
+        char verb = (p < end) ? *p++ : 'v';
+        if (ai >= args.len) { printf("%%!(MISSING)"); continue; }
+        hg_iface_t a = args.ptr[ai++];
+        switch (verb) {
+        case 'd': case 'i':
+            if (a.itab==HG_TYPE_INT64||a.itab==HG_TYPE_INT32||a.itab==HG_TYPE_INT16||a.itab==HG_TYPE_INT8)
+                printf("%lld", (long long)*(int64_t*)a.data);
+            else if (a.itab==HG_TYPE_UINT64||a.itab==HG_TYPE_UINT32||a.itab==HG_TYPE_UINT16||a.itab==HG_TYPE_UINT8)
+                printf("%llu", (unsigned long long)*(uint64_t*)a.data);
+            else hg_iface_print(a); break;
+        case 'u':
+            printf("%llu", (unsigned long long)*(uint64_t*)a.data); break;
+        case 's':
+            if (a.itab==HG_TYPE_STRING) {
+                hg_string_t s = *(hg_string_t*)a.data;
+                printf("%.*s", (int)s.len, s.ptr ? s.ptr : "");
+            } else hg_iface_print(a); break;
+        case 'v': hg_iface_print(a); break;
+        case 't':
+            if (a.itab==HG_TYPE_BOOL) printf("%s", *(bool*)a.data ? "true" : "false");
+            else hg_iface_print(a); break;
+        case 'f': case 'e': case 'E': case 'g': case 'G':
+            if (a.itab==HG_TYPE_FLOAT64) printf("%g", *(double*)a.data);
+            else if (a.itab==HG_TYPE_FLOAT32) printf("%g", (double)*(float*)a.data);
+            else hg_iface_print(a); break;
+        case 'x':
+            if (a.itab==HG_TYPE_INT64||a.itab==HG_TYPE_UINT64)
+                printf("%llx", (unsigned long long)*(uint64_t*)a.data);
+            else hg_iface_print(a); break;
+        case 'X':
+            if (a.itab==HG_TYPE_INT64||a.itab==HG_TYPE_UINT64)
+                printf("%llX", (unsigned long long)*(uint64_t*)a.data);
+            else hg_iface_print(a); break;
+        case 'o':
+            if (a.itab==HG_TYPE_INT64||a.itab==HG_TYPE_UINT64)
+                printf("%llo", (unsigned long long)*(uint64_t*)a.data);
+            else hg_iface_print(a); break;
+        case 'b':
+            /* Go %b prints binary; C has no %b — emit manually for ints */
+            if (a.itab==HG_TYPE_INT64||a.itab==HG_TYPE_UINT64) {
+                uint64_t val = *(uint64_t*)a.data;
+                if (val == 0) { putchar('0'); break; }
+                char buf[65]; int i = 64;
+                buf[i] = 0;
+                while (val) { buf[--i] = '0' + (int)(val&1); val >>= 1; }
+                printf("%s", buf+i);
+            } else hg_iface_print(a); break;
+        case 'c':
+            if (a.itab==HG_TYPE_INT64) printf("%c", (int)*(int64_t*)a.data);
+            else hg_iface_print(a); break;
+        case 'p': printf("%p", a.data); break;
+        default: putchar('%'); putchar(verb); break;
+        }
+    }
 }

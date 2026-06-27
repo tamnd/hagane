@@ -71,11 +71,27 @@ func (pe *pkgEmitter) emitHeader() {
 		fmt.Fprintf(h, "} %s;\n", cname)
 	}
 
-	for _, mem := range pe.pkg.Members {
-		fn, ok := mem.(*ssa.Function)
-		if !ok || fn.Blocks == nil {
-			continue
+	// Collect function members in sorted order for deterministic output.
+	var fnNames []string
+	for name, mem := range pe.pkg.Members {
+		if fn, ok := mem.(*ssa.Function); ok && fn.Blocks != nil {
+			fnNames = append(fnNames, name)
 		}
+	}
+	sort.Strings(fnNames)
+
+	// Emit multi-return struct typedefs before function prototypes.
+	for _, name := range fnNames {
+		fn := pe.pkg.Members[name].(*ssa.Function)
+		if fn.Signature.Results().Len() > 1 {
+			decl := retStructDecl(pe.e, pe.prefix(), sanitizeName(fn.Name()), fn.Signature.Results())
+			fmt.Fprintf(h, "%s\n", decl)
+		}
+	}
+
+	// Emit function prototypes.
+	for _, name := range fnNames {
+		fn := pe.pkg.Members[name].(*ssa.Function)
 		fmt.Fprintf(h, "%s;\n", pe.funcSignature(fn))
 	}
 }
@@ -111,12 +127,6 @@ func (pe *pkgEmitter) returnCType(fn *ssa.Function) string {
 // emitFunc emits a complete C function definition into e.buf.
 func (pe *pkgEmitter) emitFunc(fn *ssa.Function) {
 	b := pe.e.buf
-
-	// emit multi-return struct typedef into header
-	if fn.Signature.Results().Len() > 1 {
-		decl := retStructDecl(pe.e, pe.prefix(), sanitizeName(fn.Name()), fn.Signature.Results())
-		fmt.Fprintf(pe.e.hdrbuf, "%s\n", decl)
-	}
 
 	pe.emitNeededSliceTypes(fn)
 

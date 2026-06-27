@@ -295,13 +295,29 @@ func (pe *pkgEmitter) emitBinOp(v *ssa.BinOp, b *bytes.Buffer) {
 			expr = fmt.Sprintf("%s != %s", x, y)
 		}
 	case token.LSS:
-		expr = fmt.Sprintf("%s < %s", x, y)
+		if isString(v.X.Type().Underlying()) {
+			expr = fmt.Sprintf("hg_string_compare(%s, %s) < 0", x, y)
+		} else {
+			expr = fmt.Sprintf("%s < %s", x, y)
+		}
 	case token.LEQ:
-		expr = fmt.Sprintf("%s <= %s", x, y)
+		if isString(v.X.Type().Underlying()) {
+			expr = fmt.Sprintf("hg_string_compare(%s, %s) <= 0", x, y)
+		} else {
+			expr = fmt.Sprintf("%s <= %s", x, y)
+		}
 	case token.GTR:
-		expr = fmt.Sprintf("%s > %s", x, y)
+		if isString(v.X.Type().Underlying()) {
+			expr = fmt.Sprintf("hg_string_compare(%s, %s) > 0", x, y)
+		} else {
+			expr = fmt.Sprintf("%s > %s", x, y)
+		}
 	case token.GEQ:
-		expr = fmt.Sprintf("%s >= %s", x, y)
+		if isString(v.X.Type().Underlying()) {
+			expr = fmt.Sprintf("hg_string_compare(%s, %s) >= 0", x, y)
+		} else {
+			expr = fmt.Sprintf("%s >= %s", x, y)
+		}
 	default:
 		expr = fmt.Sprintf("/* unknown binop %s */ 0", op)
 	}
@@ -334,7 +350,8 @@ func (pe *pkgEmitter) emitUnOp(v *ssa.UnOp, b *bytes.Buffer) {
 	case token.MUL: // pointer deref
 		pos := pe.posStr(v.Pos())
 		fmt.Fprintf(b, "    hg_nil_check(%s, \"%s\", 0);\n", x, pos)
-		expr = fmt.Sprintf("*(%s)", x)
+		ct := pe.e.cTypeOf(v.Type())
+		expr = fmt.Sprintf("*((%s*)%s)", ct, x)
 	case token.ARROW: // channel receive — stub
 		fmt.Fprintf(b, "    /* channel recv not supported in M0 */\n")
 		fmt.Fprintf(b, "    %s %s; memset(&%s, 0, sizeof(%s));\n", ct, valueName(v), valueName(v), valueName(v))
@@ -375,12 +392,164 @@ func (pe *pkgEmitter) emitCall(v *ssa.Call, b *bytes.Buffer) {
 			}
 			return
 		}
+
+		if builtin, ok := cc.Value.(*ssa.Builtin); ok {
+			pe.emitBuiltin(builtin.Name(), cc.Args, v, b)
+			return
+		}
 	}
 
 	// fallback: indirect or invoke call
 	ct := pe.e.cTypeOf(v.Type())
+	if ct == "void" || v.Type() == nil || v.Type() == types.Typ[types.Invalid] {
+		fmt.Fprintf(b, "    /* indirect/invoke call M0 stub */\n")
+		return
+	}
 	fmt.Fprintf(b, "    %s %s; memset(&%s, 0, sizeof(%s)); /* indirect/invoke call M0 stub */\n",
 		ct, valueName(v), valueName(v), valueName(v))
+}
+
+func (pe *pkgEmitter) emitBuiltin(name string, args []ssa.Value, v *ssa.Call, b *bytes.Buffer) {
+	hasResult := v.Type() != nil && v.Type() != types.Typ[types.Invalid]
+	var ct string
+	if hasResult {
+		ct = pe.e.cTypeOf(v.Type())
+	}
+
+	switch name {
+	case "len":
+		if !hasResult {
+			return
+		}
+		x := pe.emitValue(args[0])
+		switch args[0].Type().Underlying().(type) {
+		case *types.Slice:
+			fmt.Fprintf(b, "    %s %s = %s.len;\n", ct, valueName(v), x)
+		case *types.Basic: // string
+			fmt.Fprintf(b, "    %s %s = %s.len;\n", ct, valueName(v), x)
+		case *types.Array:
+			arr := args[0].Type().Underlying().(*types.Array)
+			fmt.Fprintf(b, "    %s %s = (%s)%d;\n", ct, valueName(v), ct, arr.Len())
+		case *types.Map:
+			fmt.Fprintf(b, "    %s %s = 0; /* map len M0 stub */\n", ct, valueName(v))
+		default:
+			fmt.Fprintf(b, "    %s %s = 0; /* len: unknown type */\n", ct, valueName(v))
+		}
+
+	case "cap":
+		if !hasResult {
+			return
+		}
+		x := pe.emitValue(args[0])
+		switch args[0].Type().Underlying().(type) {
+		case *types.Slice:
+			fmt.Fprintf(b, "    %s %s = %s.cap;\n", ct, valueName(v), x)
+		case *types.Array:
+			arr := args[0].Type().Underlying().(*types.Array)
+			fmt.Fprintf(b, "    %s %s = (%s)%d;\n", ct, valueName(v), ct, arr.Len())
+		default:
+			fmt.Fprintf(b, "    %s %s = 0;\n", ct, valueName(v))
+		}
+
+	case "append":
+		if !hasResult {
+			return
+		}
+		x := pe.emitValue(args[0])
+		sl := args[0].Type().Underlying().(*types.Slice)
+		elemCT := pe.e.cTypeOf(sl.Elem())
+		vn := valueName(v)
+		appendOne := func(src, elem string) {
+			fmt.Fprintf(b, "    %s %s; { %s _as = %s; %s _ae = %s;\n", ct, vn, ct, src, elemCT, elem)
+			fmt.Fprintf(b, "        if (_as.len >= _as.cap) { int64_t _nc = _as.cap*2; if(_nc<_as.len+1)_nc=_as.len+1; if(_nc<4)_nc=4;\n")
+			fmt.Fprintf(b, "            %s *_p = (%s*)realloc(_as.ptr,(size_t)_nc*sizeof(%s)); if(!_p){fprintf(stderr,\"hagane: oom\\n\");abort();}\n", elemCT, elemCT, elemCT)
+			fmt.Fprintf(b, "            _as.ptr=_p; _as.cap=_nc; } _as.ptr[_as.len++]=_ae; %s=_as; }\n", vn)
+		}
+		if len(args) == 2 {
+			y := pe.emitValue(args[1])
+			if _, ok := args[1].Type().Underlying().(*types.Slice); ok {
+				// append(s, s2...)
+				fmt.Fprintf(b, "    %s %s; { %s _ad=%s; %s _as2=%s;\n", ct, vn, ct, x, ct, y)
+				fmt.Fprintf(b, "        int64_t _an=_ad.len+_as2.len; if(_an>_ad.cap){\n")
+				fmt.Fprintf(b, "            int64_t _nc=_ad.cap*2; if(_nc<_an)_nc=_an;\n")
+				fmt.Fprintf(b, "            %s *_p=(%s*)realloc(_ad.ptr,(size_t)_nc*sizeof(%s)); if(!_p){fprintf(stderr,\"hagane: oom\\n\");abort();}\n", elemCT, elemCT, elemCT)
+				fmt.Fprintf(b, "            _ad.ptr=_p; _ad.cap=_nc; }\n")
+				fmt.Fprintf(b, "        memcpy(_ad.ptr+_ad.len,_as2.ptr,(size_t)_as2.len*sizeof(%s)); _ad.len+=_as2.len; %s=_ad; }\n", elemCT, vn)
+			} else {
+				appendOne(x, y)
+			}
+		} else if len(args) > 2 {
+			fmt.Fprintf(b, "    %s %s = %s;\n", ct, vn, x)
+			for _, a := range args[1:] {
+				av := pe.emitValue(a)
+				fmt.Fprintf(b, "    { %s _as=%s; %s _ae=%s;\n", ct, vn, elemCT, av)
+				fmt.Fprintf(b, "        if(_as.len>=_as.cap){int64_t _nc=_as.cap*2;if(_nc<_as.len+1)_nc=_as.len+1;if(_nc<4)_nc=4;\n")
+				fmt.Fprintf(b, "            %s *_p=(%s*)realloc(_as.ptr,(size_t)_nc*sizeof(%s));if(!_p){fprintf(stderr,\"hagane: oom\\n\");abort();}\n", elemCT, elemCT, elemCT)
+				fmt.Fprintf(b, "            _as.ptr=_p;_as.cap=_nc;} _as.ptr[_as.len++]=_ae; %s=_as; }\n", vn)
+			}
+		} else {
+			fmt.Fprintf(b, "    %s %s = %s;\n", ct, vn, x)
+		}
+
+	case "copy":
+		sl := args[0].Type().Underlying().(*types.Slice)
+		elemCT := pe.e.cTypeOf(sl.Elem())
+		x := pe.emitValue(args[0])
+		y := pe.emitValue(args[1])
+		if hasResult {
+			fmt.Fprintf(b, "    %s %s; { int64_t _n=%s.len<%s.len?%s.len:%s.len; if(_n>0)memmove(%s.ptr,%s.ptr,(size_t)_n*sizeof(%s)); %s=_n; }\n",
+				ct, valueName(v), x, y, x, y, x, y, elemCT, valueName(v))
+		} else {
+			fmt.Fprintf(b, "    { int64_t _n=%s.len<%s.len?%s.len:%s.len; if(_n>0)memmove(%s.ptr,%s.ptr,(size_t)_n*sizeof(%s)); }\n",
+				x, y, x, y, x, y, elemCT)
+		}
+
+	case "new":
+		if !hasResult {
+			return
+		}
+		elemCT := pe.e.cTypeOf(args[0].Type())
+		fmt.Fprintf(b, "    %s %s = (%s)hg_alloc(sizeof(%s));\n", ct, valueName(v), ct, elemCT)
+
+	case "delete":
+		fmt.Fprintf(b, "    /* delete: M0 stub */\n")
+
+	case "close":
+		fmt.Fprintf(b, "    /* close: M0 stub */\n")
+
+	case "panic":
+		pos := pe.posStr(v.Pos())
+		fmt.Fprintf(b, "    hg_panic(\"explicit panic\", \"%s\", 0);\n", pos)
+
+	case "recover":
+		if hasResult {
+			fmt.Fprintf(b, "    %s %s; memset(&%s, 0, sizeof(%s)); /* recover M0 stub */\n",
+				ct, valueName(v), valueName(v), valueName(v))
+		}
+
+	case "print":
+		pe.emitFmtCall("Print", args, b)
+
+	case "println":
+		pe.emitFmtCall("Println", args, b)
+
+	case "real", "imag":
+		if hasResult {
+			fmt.Fprintf(b, "    %s %s = 0.0; /* %s: complex not in M0 */\n", ct, valueName(v), name)
+		}
+
+	case "complex":
+		if hasResult {
+			fmt.Fprintf(b, "    %s %s; memset(&%s, 0, sizeof(%s)); /* complex M0 stub */\n",
+				ct, valueName(v), valueName(v), valueName(v))
+		}
+
+	default:
+		if hasResult {
+			fmt.Fprintf(b, "    %s %s; memset(&%s, 0, sizeof(%s)); /* builtin %s M0 stub */\n",
+				ct, valueName(v), valueName(v), valueName(v), name)
+		}
+	}
 }
 
 // emitFmtCall handles fmt.Println, fmt.Printf, fmt.Print etc. as C printf calls.
@@ -687,7 +856,9 @@ func (pe *pkgEmitter) zeroFor(t types.Type) string {
 	case *types.Interface:
 		return "HG_ZERO_IFACE"
 	}
-	return "{0}"
+	// Slice, struct, array: use a C compound literal so it's valid in function-call position.
+	ct := pe.e.cTypeInner(t)
+	return fmt.Sprintf("(%s){0}", ct)
 }
 
 func (pe *pkgEmitter) formatArgs(args []ssa.Value) string {
@@ -817,21 +988,3 @@ func escapeCStr(s string) string {
 	return sb.String()
 }
 
-func extractStringConst(v ssa.Value) string {
-	c, ok := v.(*ssa.Const)
-	if !ok || c.Value == nil {
-		return ""
-	}
-	if isString(c.Type().Underlying()) {
-		return constant.StringVal(c.Value)
-	}
-	return ""
-}
-
-// goFmtToCFmt converts a Go format string to a C printf format string.
-// This is a best-effort M0 conversion.
-func goFmtToCFmt(s string) string {
-	// In Go, %v on a number is the same as %d/%g; we leave it for now.
-	// Replace %v with %s for strings (handled at call site via args)
-	return s
-}
