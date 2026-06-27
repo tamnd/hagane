@@ -48,8 +48,8 @@ func (e *Emitter) userTypeName(named *types.Named) string {
 func (e *Emitter) userItabName(concreteT, ifaceT types.Type) string {
 	concreteStr := typeKey(concreteT)
 	ifaceStr := typeKey(ifaceT)
-	concreteStr = strings.NewReplacer("/", "_", ".", "_", "*", "ptr", "-", "_", " ", "_").Replace(concreteStr)
-	ifaceStr = strings.NewReplacer("/", "_", ".", "_", "*", "ptr", "-", "_", " ", "_", "{", "", "}", "").Replace(ifaceStr)
+	concreteStr = strings.NewReplacer("/", "_", ".", "_", "*", "ptr", "-", "_", " ", "_", "[", "sl_", "]", "").Replace(concreteStr)
+	ifaceStr = strings.NewReplacer("/", "_", ".", "_", "*", "ptr", "-", "_", " ", "_", "{", "", "}", "", "[", "sl_", "]", "").Replace(ifaceStr)
 	return "hg_itab_" + sanitizeName(ifaceStr) + "_" + sanitizeName(concreteStr)
 }
 
@@ -90,6 +90,75 @@ func (e *Emitter) registerItab(concreteT, ifaceT types.Type) string {
 	return "&" + e.userItabName(concreteT, ifaceT)
 }
 
+// compositeTypeDescName returns the C variable name for a hg_type_t of a composite type.
+// For primitive/named types, returns the existing descriptor name.
+// For slices, returns "hg_type_sl_X" where X is the element type name.
+func (e *Emitter) compositeTypeDescName(t types.Type) string {
+	switch u := t.(type) {
+	case *types.Slice:
+		elemName := e.compositeTypeDescName(u.Elem())
+		return "hg_type_sl_" + sanitizeName(elemName)
+	case *types.Named:
+		return e.userTypeName(u)
+	case *types.Pointer:
+		if named, ok := u.Elem().(*types.Named); ok {
+			return e.userTypeName(named)
+		}
+	case *types.Basic:
+		switch u.Kind() {
+		case types.Bool:
+			return "hg_type_bool"
+		case types.Int8:
+			return "hg_type_int8"
+		case types.Int16:
+			return "hg_type_int16"
+		case types.Int32:
+			return "hg_type_int32"
+		case types.Int, types.Int64:
+			return "hg_type_int64"
+		case types.Uint8:
+			return "hg_type_uint8"
+		case types.Uint16:
+			return "hg_type_uint16"
+		case types.Uint32:
+			return "hg_type_uint32"
+		case types.Uint, types.Uint64:
+			return "hg_type_uint64"
+		case types.Float32:
+			return "hg_type_float32"
+		case types.Float64:
+			return "hg_type_float64"
+		case types.String:
+			return "hg_type_string"
+		case types.Uintptr:
+			return "hg_type_uintptr"
+		}
+	}
+	return ""
+}
+
+// emitSliceTypeDesc emits a hg_type_t global for a slice type (if not already emitted).
+func (e *Emitter) emitSliceTypeDesc(sliceT *types.Slice, seenTypes map[string]bool) {
+	name := e.compositeTypeDescName(sliceT)
+	if name == "" || seenTypes[name] {
+		return
+	}
+	seenTypes[name] = true
+	// Recursively emit element type desc if it's also a slice.
+	if elemSlice, ok := sliceT.Elem().(*types.Slice); ok {
+		e.emitSliceTypeDesc(elemSlice, seenTypes)
+	}
+	ct := e.cTypeOf(sliceT)
+	elemName := e.compositeTypeDescName(sliceT.Elem())
+	goName := sliceT.String()
+	elemExpr := "NULL"
+	if elemName != "" {
+		elemExpr = "&" + elemName
+	}
+	fmt.Fprintf(e.hdrbuf, "static const hg_type_t %s = {sizeof(%s), HG_KIND_SLICE, \"%s\", %s};\n",
+		name, ct, goName, elemExpr)
+}
+
 // emitIfaceDecls emits GoType globals and itab globals for all registered (iface, concrete) pairs.
 // Called at the end of emitPkg, after all functions are emitted.
 func (e *Emitter) emitIfaceDecls() {
@@ -108,19 +177,24 @@ func (e *Emitter) emitIfaceDecls() {
 	seenTypes := map[string]bool{}
 	for _, k := range keys {
 		pair := e.ifacePairs[k]
-		// Resolve named type from both T and *T concrete types.
-		concreteNamed := func(t types.Type) *types.Named {
-			if ptr, ok := t.(*types.Pointer); ok {
-				t = ptr.Elem()
-			}
-			named, _ := t.(*types.Named)
-			return named
-		}(pair.concrete)
-		if concreteNamed != nil {
-			typeName := e.userTypeName(concreteNamed)
-			if !seenTypes[typeName] {
-				seenTypes[typeName] = true
-				e.emitUserTypeDesc(concreteNamed, typeName)
+		switch ct := pair.concrete.(type) {
+		case *types.Slice:
+			e.emitSliceTypeDesc(ct, seenTypes)
+		default:
+			// Resolve named type from both T and *T concrete types.
+			concreteNamed := func(t types.Type) *types.Named {
+				if ptr, ok := t.(*types.Pointer); ok {
+					t = ptr.Elem()
+				}
+				named, _ := t.(*types.Named)
+				return named
+			}(pair.concrete)
+			if concreteNamed != nil {
+				typeName := e.userTypeName(concreteNamed)
+				if !seenTypes[typeName] {
+					seenTypes[typeName] = true
+					e.emitUserTypeDesc(concreteNamed, typeName)
+				}
 			}
 		}
 	}
@@ -150,7 +224,7 @@ func (e *Emitter) emitItabGlobal(pair ifacePair) {
 
 	itabName := e.userItabName(pair.concrete, pair.iface)
 
-	// Resolve named type — concrete may be *T (pointer to named) or T (named directly).
+	// Resolve the type descriptor expression for the concrete type.
 	var named *types.Named
 	isNamed := false
 	switch ct := pair.concrete.(type) {
@@ -166,6 +240,8 @@ func (e *Emitter) emitItabGlobal(pair ifacePair) {
 	typeName := "NULL"
 	if isNamed {
 		typeName = "&" + e.userTypeName(named)
+	} else if descName := e.compositeTypeDescName(pair.concrete); descName != "" {
+		typeName = "&" + descName
 	}
 
 	// Determine method order (alphabetical per spec)

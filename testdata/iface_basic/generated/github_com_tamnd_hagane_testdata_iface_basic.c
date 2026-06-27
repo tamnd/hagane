@@ -13,8 +13,8 @@ typedef struct {
 void hg_github_com_tamnd_hagane_testdata_iface_basic_greet(hg_github_com_tamnd_hagane_testdata_iface_basic_Greeter_t g);
 void hg_github_com_tamnd_hagane_testdata_iface_basic_init(void);
 void hg_github_com_tamnd_hagane_testdata_iface_basic_main(void);
-hg_string_t hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish_Greet(hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish_t s);
 hg_string_t hg_github_com_tamnd_hagane_testdata_iface_basic_English_Greet(hg_github_com_tamnd_hagane_testdata_iface_basic_English_t e);
+hg_string_t hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish_Greet(hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish_t s);
 typedef struct { hg_iface_t elems[1]; } hg_array_hg_iface_t_1_t;
 typedef struct { hg_github_com_tamnd_hagane_testdata_iface_basic_English_t r0; bool r1; } _hg_ta_hg_github_com_tamnd_hagane_testdata_iface_basic_English_t_t;
 typedef struct { hg_iface_t elems[2]; } hg_array_hg_iface_t_2_t;
@@ -28,20 +28,6 @@ static hg_string_t hg_itab_github_com_tamnd_hagane_testdata_iface_basic_Greeter_
 static void* hg_itab_github_com_tamnd_hagane_testdata_iface_basic_Greeter_github_com_tamnd_hagane_testdata_iface_basic_Spanish_methods[] = {(void*)hg_itab_github_com_tamnd_hagane_testdata_iface_basic_Greeter_github_com_tamnd_hagane_testdata_iface_basic_Spanish_w0};
 static const hg_iface_tab_t hg_itab_github_com_tamnd_hagane_testdata_iface_basic_Greeter_github_com_tamnd_hagane_testdata_iface_basic_Spanish = {&hg_type_hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish, hg_itab_github_com_tamnd_hagane_testdata_iface_basic_Greeter_github_com_tamnd_hagane_testdata_iface_basic_Spanish_methods};
 
-hg_string_t hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish_Greet(hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish_t s) {
-    goto blk0;
-blk0:;
-    hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish_t _local_t0; memset(&_local_t0, 0, sizeof(hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish_t));
-    hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish_t* t0 = &_local_t0;
-    hg_nil_check(t0, "?", 0);
-    *(t0) = s;
-    hg_string_t* t1 = &(t0)->name;
-    hg_nil_check(t1, "/Users/apple/github/tamnd/hagane/testdata/iface_basic/main.go:13", 0);
-    hg_string_t t2 = *((hg_string_t*)t1);
-    hg_string_t t3 = hg_string_concat(hg_string_lit("Hola, "), t2);
-    return t3;
-}
-
 hg_string_t hg_github_com_tamnd_hagane_testdata_iface_basic_English_Greet(hg_github_com_tamnd_hagane_testdata_iface_basic_English_t e) {
     goto blk0;
 blk0:;
@@ -53,6 +39,20 @@ blk0:;
     hg_nil_check(t1, "/Users/apple/github/tamnd/hagane/testdata/iface_basic/main.go:12", 0);
     hg_string_t t2 = *((hg_string_t*)t1);
     hg_string_t t3 = hg_string_concat(hg_string_lit("Hello, "), t2);
+    return t3;
+}
+
+hg_string_t hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish_Greet(hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish_t s) {
+    goto blk0;
+blk0:;
+    hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish_t _local_t0; memset(&_local_t0, 0, sizeof(hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish_t));
+    hg_github_com_tamnd_hagane_testdata_iface_basic_Spanish_t* t0 = &_local_t0;
+    hg_nil_check(t0, "?", 0);
+    *(t0) = s;
+    hg_string_t* t1 = &(t0)->name;
+    hg_nil_check(t1, "/Users/apple/github/tamnd/hagane/testdata/iface_basic/main.go:13", 0);
+    hg_string_t t2 = *((hg_string_t*)t1);
+    hg_string_t t3 = hg_string_concat(hg_string_lit("Hola, "), t2);
     return t3;
 }
 

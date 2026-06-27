@@ -44,6 +44,9 @@ func (pe *pkgEmitter) emitInstr(fn *ssa.Function, blk *ssa.BasicBlock, instr ssa
 		// nothing to emit here
 
 	case *ssa.Alloc:
+		if pe.earlyAllocs[v] {
+			break // already emitted before setjmp; skip
+		}
 		pe.emitAlloc(v, b)
 
 	case *ssa.Store:
@@ -89,15 +92,22 @@ func (pe *pkgEmitter) emitInstr(fn *ssa.Function, blk *ssa.BasicBlock, instr ssa
 		toT := v.Type().Underlying()
 		ct := pe.e.cTypeOf(v.Type())
 		xName := pe.emitValue(v.X)
-		// string ↔ []byte conversions
+		// string ↔ []byte — must copy so the slice is mutable
 		if isString(fromT) && isByteSlice(toT) {
-			fmt.Fprintf(b, "    %s %s; { hg_slice_uint8_t _bs = {.ptr=(uint8_t*)%s.ptr, .len=%s.len, .cap=%s.len}; %s=_bs; }\n",
-				ct, valueName(v), xName, xName, xName, valueName(v))
+			fmt.Fprintf(b, "    %s %s = hg_string_to_bytes(%s);\n", ct, valueName(v), xName)
 			return
 		}
 		if isByteSlice(fromT) && isString(toT) {
-			fmt.Fprintf(b, "    %s %s = (hg_string_t){.ptr=(const char*)%s.ptr, .len=%s.len};\n",
-				ct, valueName(v), xName, xName)
+			fmt.Fprintf(b, "    %s %s = hg_bytes_to_string(%s);\n", ct, valueName(v), xName)
+			return
+		}
+		// string ↔ []rune ([]int32)
+		if isString(fromT) && isRuneSlice(toT) {
+			fmt.Fprintf(b, "    %s %s = hg_string_to_runes(%s);\n", ct, valueName(v), xName)
+			return
+		}
+		if isRuneSlice(fromT) && isString(toT) {
+			fmt.Fprintf(b, "    %s %s = hg_runes_to_string(%s);\n", ct, valueName(v), xName)
 			return
 		}
 		fmt.Fprintf(b, "    %s %s = (%s)(%s);\n", ct, valueName(v), ct, xName)
@@ -145,8 +155,7 @@ func (pe *pkgEmitter) emitInstr(fn *ssa.Function, blk *ssa.BasicBlock, instr ssa
 		fmt.Fprintf(b, "    %s %s = %s.r%d;\n", ct, valueName(v), parent, v.Index)
 
 	case *ssa.Panic:
-		pos := pe.posStr(v.Pos())
-		fmt.Fprintf(b, "    hg_panic(\"explicit panic\", \"%s\", 0);\n", pos)
+		fmt.Fprintf(b, "    hg_throw(%s);\n", pe.emitValue(v.X))
 
 	case *ssa.RunDefers:
 		fmt.Fprintf(b, "    hg_run_defers(_hg_defer_head);\n")
@@ -785,13 +794,28 @@ func (pe *pkgEmitter) emitBuiltin(name string, args []ssa.Value, v *ssa.Call, b 
 		fmt.Fprintf(b, "    /* close: M0 stub */\n")
 
 	case "panic":
-		pos := pe.posStr(v.Pos())
-		fmt.Fprintf(b, "    hg_panic(\"explicit panic\", \"%s\", 0);\n", pos)
+		// builtin panic(x): box x as interface{} then throw
+		if len(args) == 1 {
+			arg := args[0]
+			xName := pe.emitValue(arg)
+			if _, isIface := arg.Type().Underlying().(*types.Interface); isIface {
+				fmt.Fprintf(b, "    hg_throw(%s);\n", xName)
+			} else {
+				xt := pe.e.cTypeOf(arg.Type())
+				itab := pe.e.ifaceItabExpr(arg.Type(), types.NewInterfaceType(nil, nil))
+				if _, isPtr := arg.Type().Underlying().(*types.Pointer); isPtr {
+					fmt.Fprintf(b, "    { hg_iface_t _pv; _pv.data=(void*)(%s); _pv.itab=(const void*)%s; hg_throw(_pv); }\n", xName, itab)
+				} else {
+					fmt.Fprintf(b, "    { %s *_pb=(%s*)hg_alloc(sizeof(%s)); *_pb=%s; hg_iface_t _pv; _pv.data=_pb; _pv.itab=(const void*)%s; hg_throw(_pv); }\n", xt, xt, xt, xName, itab)
+				}
+			}
+		}
 
 	case "recover":
 		if hasResult {
-			fmt.Fprintf(b, "    %s %s; memset(&%s, 0, sizeof(%s)); /* recover M0 stub */\n",
-				ct, valueName(v), valueName(v), valueName(v))
+			fmt.Fprintf(b, "    %s %s = hg_recover();\n", ct, valueName(v))
+		} else {
+			fmt.Fprintf(b, "    hg_recover();\n")
 		}
 
 	case "print":
@@ -912,6 +936,10 @@ func fmtVerb(pe *pkgEmitter, v ssa.Value) (string, string, string) {
 }
 
 func (pe *pkgEmitter) emitReturn(fn *ssa.Function, v *ssa.Return, b *bytes.Buffer) {
+	// pop panic frame on normal exit (recover block already popped it in setjmp handler)
+	if pe.curFnHasFrame && !pe.inRecoverBlk {
+		fmt.Fprintf(b, "    hg_panic_frame_pop(&_hg_frame);\n")
+	}
 	results := fn.Signature.Results()
 	switch results.Len() {
 	case 0:
@@ -1282,6 +1310,15 @@ func isByteSlice(t types.Type) bool {
 	return ok && b.Kind() == types.Uint8
 }
 
+func isRuneSlice(t types.Type) bool {
+	sl, ok := t.(*types.Slice)
+	if !ok {
+		return false
+	}
+	b, ok := sl.Elem().Underlying().(*types.Basic)
+	return ok && (b.Kind() == types.Int32 || b.Kind() == types.Rune)
+}
+
 func intSuffix(k types.BasicKind) string {
 	switch k {
 	case types.Int8:
@@ -1395,7 +1432,36 @@ func (pe *pkgEmitter) emitDefer(v *ssa.Defer, b *bytes.Buffer) {
 	callFn := ""
 	switch fn := v.Call.Value.(type) {
 	case *ssa.Function:
-		callFn = pe.prefix() + sanitizeName(fn.Name())
+		if fn.Package() != nil {
+			pkg := fn.Package().Pkg.Path()
+			switch pkg {
+			case "fmt":
+				// map to runtime shim
+				switch fn.Name() {
+				case "Println":
+					callFn = "hg_fmt_println"
+				case "Print":
+					callFn = "hg_fmt_print"
+				case "Printf":
+					callFn = "hg_fmt_printf"
+				default:
+					fmt.Fprintf(b, "    /* defer fmt.%s: unimplemented */\n", fn.Name())
+					return
+				}
+			default:
+				if skipPkg(fn.Package()) {
+					fmt.Fprintf(b, "    /* defer call to %s.%s: skipped */\n", pkg, fn.Name())
+					return
+				}
+				if fn.Package() == pe.pkg {
+					callFn = pe.prefix() + methodCBaseName(fn)
+				} else {
+					callFn = pkgCPrefix(pkg) + methodCBaseName(fn)
+				}
+			}
+		} else {
+			callFn = pe.prefix() + sanitizeName(fn.Name())
+		}
 	case *ssa.Builtin:
 		fmt.Fprintf(b, "    /* defer builtin %s: M2 stub */\n", fn.Name())
 		return

@@ -7,6 +7,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <setjmp.h>
 
 /* ── string ──────────────────────────────────────────────────────────────── */
 typedef struct { const char *ptr; int64_t len; } hg_string_t;
@@ -47,6 +48,9 @@ typedef struct { double    *ptr; int64_t len; int64_t cap; } hg_slice_double_t;
 typedef struct { hg_string_t *ptr; int64_t len; int64_t cap; } hg_slice_hg_string_t_t;
 typedef struct { hg_iface_t  *ptr; int64_t len; int64_t cap; } hg_slice_hg_iface_t_t;
 typedef struct { void       **ptr; int64_t len; int64_t cap; } hg_slice_voidptr_t;
+
+/* ── generic raw slice (for runtime reflection) ──────────────────────────── */
+typedef struct { void *ptr; int64_t len; int64_t cap; } hg_rawslice_t;
 
 /* ── safety checks ───────────────────────────────────────────────────────── */
 #define hg_bounds_check(idx, len, file, line) do { \
@@ -147,15 +151,19 @@ typedef struct { void       **ptr; int64_t len; int64_t cap; } hg_slice_voidptr_
 typedef struct hg_type_s {
     uint32_t    size;   /* sizeof(T) */
     uint8_t     kind;   /* HG_KIND_* */
-    const char *name;   /* package-qualified name */
+    const char *name;   /* package-qualified name or Go type string */
+    const struct hg_type_s *elem; /* for slices/arrays: element type; NULL otherwise */
 } hg_type_t;
 
 /* Interface method table — one per (interface type, concrete type) pair.
    For concrete types without any interface methods (plain boxed into any),
-   methods == NULL. */
+   methods == NULL.
+   stringer is non-NULL when the concrete type has an Error() or String() method
+   that returns a string; used by hg_iface_fprint/sbuf for default %v printing. */
 typedef struct {
     const hg_type_t *type;    /* concrete type descriptor */
     void           **methods; /* method function pointers, in interface method order */
+    hg_string_t    (*stringer)(void*); /* optional: Error()/String() → string */
 } hg_iface_tab_t;
 
 /* Primitive type descriptors (defined in hagane_rt.c) */
@@ -205,6 +213,26 @@ static inline void hg_run_defers(hg_defer_t *head) {
     }
 }
 
+/* ── panic/recover frame ─────────────────────────────────────────────────── */
+
+typedef struct hg_panic_frame_s {
+    jmp_buf buf;
+    struct hg_panic_frame_s *prev;
+} hg_panic_frame_t;
+
+extern hg_panic_frame_t *hg_panic_top;
+extern bool              hg_panic_active;
+extern hg_iface_t        hg_panic_value;
+
+static inline void hg_panic_frame_push(hg_panic_frame_t *f) {
+    f->prev = hg_panic_top;
+    hg_panic_top = f;
+}
+
+static inline void hg_panic_frame_pop(hg_panic_frame_t *f) {
+    hg_panic_top = f->prev;
+}
+
 /* ── runtime functions ───────────────────────────────────────────────────── */
 void*        hg_alloc(size_t size);
 void*        hg_realloc(void *ptr, size_t old_size, size_t new_size);
@@ -216,7 +244,18 @@ int          hg_string_compare(hg_string_t a, hg_string_t b);
 void*        hg_makeslice_raw(size_t elem_size, int64_t len, int64_t cap);
 void*        hg_growslice_raw(size_t elem_size, void *old_ptr, int64_t len, int64_t *cap_out, int64_t extra);
 void         hg_memmove(void *dst, const void *src, size_t n);
+hg_slice_uint8_t  hg_string_to_bytes(hg_string_t s);
+hg_string_t       hg_bytes_to_string(hg_slice_uint8_t b);
+hg_slice_int32_t  hg_string_to_runes(hg_string_t s);
+hg_string_t       hg_runes_to_string(hg_slice_int32_t sl);
 void         hg_runtime_init(void);
+void         hg_throw(hg_iface_t val);
+hg_iface_t   hg_recover(void);
+void         hg_repanic(void);
+
+/* errors shim */
+hg_iface_t hg_errors_New(hg_string_t msg);
+static inline void hg_errors_init(void) {}
 
 /* fmt stubs (called from generated init functions) */
 static inline void hg_fmt_init(void) {}
