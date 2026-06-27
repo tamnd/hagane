@@ -11,12 +11,41 @@ import (
 // a value of concrete type concreteT into interface type ifaceT.
 // For primitive types, returns the singleton itab address.
 // For user-defined types, collects the pair and returns the generated itab name.
+// Returns NULL only when the itab truly cannot be generated (non-transpiled packages).
 func (e *Emitter) ifaceItabExpr(concreteT, ifaceT types.Type) string {
 	if itab := primitiveItab(concreteT); itab != "" {
 		return itab
 	}
-	// User-defined type: ensure itab is registered and return its name
+	// Only return NULL if the concrete or interface type is from a truly non-transpiled
+	// package (we can't generate method bodies for it). Do NOT return NULL for cross-package
+	// pairs: the itab is already emitted in the other package's header and we just reference it.
+	if e.isNonTranspilablePair(concreteT, ifaceT) {
+		return "NULL"
+	}
 	return e.registerItab(concreteT, ifaceT)
+}
+
+// isNonTranspilablePair returns true when either the concrete or interface type
+// belongs to a package that is NOT being transpiled. In that case no C itab can
+// be generated and the caller should emit NULL.
+func (e *Emitter) isNonTranspilablePair(concreteT, ifaceT types.Type) bool {
+	if named, ok := ifaceT.(*types.Named); ok {
+		pkg := named.Obj().Pkg()
+		if pkg != nil && !e.isTranspiled(pkg.Path()) {
+			return true
+		}
+	}
+	ct := concreteT
+	if ptr, ok := ct.(*types.Pointer); ok {
+		ct = ptr.Elem()
+	}
+	if named, ok := ct.(*types.Named); ok {
+		pkg := named.Obj().Pkg()
+		if pkg != nil && !e.isTranspiled(pkg.Path()) {
+			return true
+		}
+	}
+	return false
 }
 
 // typeDescPtr returns the C expression for the hg_type_t* of a type (for TypeAssert).
@@ -48,8 +77,10 @@ func (e *Emitter) userTypeName(named *types.Named) string {
 func (e *Emitter) userItabName(concreteT, ifaceT types.Type) string {
 	concreteStr := typeKey(concreteT)
 	ifaceStr := typeKey(ifaceT)
-	concreteStr = strings.NewReplacer("/", "_", ".", "_", "*", "ptr", "-", "_", " ", "_", "[", "sl_", "]", "").Replace(concreteStr)
-	ifaceStr = strings.NewReplacer("/", "_", ".", "_", "*", "ptr", "-", "_", " ", "_", "{", "", "}", "", "[", "sl_", "]", "").Replace(ifaceStr)
+	r := strings.NewReplacer("/", "_", ".", "_", "*", "ptr", "-", "_", " ", "_",
+		"[", "sl_", "]", "", "{", "", "}", "", ";", "_", ",", "_")
+	concreteStr = r.Replace(concreteStr)
+	ifaceStr = r.Replace(ifaceStr)
 	return "hg_itab_" + sanitizeName(ifaceStr) + "_" + sanitizeName(concreteStr)
 }
 
@@ -148,6 +179,14 @@ func (e *Emitter) emitSliceTypeDesc(sliceT *types.Slice, seenTypes map[string]bo
 	if elemSlice, ok := sliceT.Elem().(*types.Slice); ok {
 		e.emitSliceTypeDesc(elemSlice, seenTypes)
 	}
+	// If the element is a named type, ensure its type descriptor is emitted too.
+	if elemNamed, ok := sliceT.Elem().(*types.Named); ok {
+		elemName := e.userTypeName(elemNamed)
+		if !seenTypes[elemName] {
+			seenTypes[elemName] = true
+			e.emitUserTypeDesc(elemNamed, elemName)
+		}
+	}
 	ct := e.cTypeOf(sliceT)
 	elemName := e.compositeTypeDescName(sliceT.Elem())
 	goName := sliceT.String()
@@ -199,20 +238,69 @@ func (e *Emitter) emitIfaceDecls() {
 		}
 	}
 
-	// Emit itab globals for each pair
+	// Emit itab globals for each pair.
+	// Only emit when the concrete type's package is the current package being emitted
+	// (or unknown/unnamed) — types from other packages define their itabs in their own
+	// headers, which we include via #include, so redefining them here causes errors.
 	for _, k := range keys {
 		pair := e.ifacePairs[k]
+		if skip := e.shouldSkipItab(pair); skip {
+			continue
+		}
 		e.emitItabGlobal(pair)
 	}
 }
 
 // emitUserTypeDesc emits a hg_type_t global for a named user type.
+// Only emits when the type belongs to the package currently being emitted;
+// types from other packages are declared in their own package header.
 func (e *Emitter) emitUserTypeDesc(named *types.Named, typeName string) {
+	if e.pkg != nil && named.Obj().Pkg().Path() != e.pkg.Pkg.Path() {
+		// The type is from another package — its descriptor lives in that package's
+		// header. Don't redefine it here to avoid duplicate-definition errors.
+		return
+	}
 	ct := e.cTypeOf(named)
 	kind := goTypeKind(named.Underlying())
 	qualName := named.Obj().Pkg().Path() + "." + named.Obj().Name()
 	fmt.Fprintf(e.hdrbuf, "static const hg_type_t %s = {sizeof(%s), %s, \"%s\"};\n",
 		typeName, ct, kind, qualName)
+}
+
+// shouldSkipItab returns true if the itab for this pair should not be emitted in the
+// current package's header. We skip when:
+//   - the concrete type belongs to a different transpiled package (its itab lives there)
+//   - either type belongs to a non-transpiled package (we can't generate method bodies)
+func (e *Emitter) shouldSkipItab(pair ifacePair) bool {
+	// Resolve the named concrete type.
+	ct := pair.concrete
+	if ptr, ok := ct.(*types.Pointer); ok {
+		ct = ptr.Elem()
+	}
+
+	// If either the interface or concrete type is from a non-transpiled package, skip.
+	if named, ok := pair.iface.(*types.Named); ok {
+		pkg := named.Obj().Pkg()
+		if pkg != nil && !e.isTranspiled(pkg.Path()) {
+			return true
+		}
+	}
+	if named, ok := ct.(*types.Named); ok {
+		pkg := named.Obj().Pkg()
+		if pkg != nil && !e.isTranspiled(pkg.Path()) {
+			return true
+		}
+		// If the concrete type belongs to a different package than the current one,
+		// its itab is already emitted in that package's header (which we #include).
+		// Compare by path, not pointer: test-augmented packages (e.g. sort [sort.test])
+		// share the same path as the regular package but have different *types.Package objects.
+		if e.pkg != nil && pkg.Path() != e.pkg.Pkg.Path() {
+			return true
+		}
+	}
+
+	// Slice concrete types don't belong to a specific package — emit here.
+	return false
 }
 
 // emitItabGlobal emits the method pointer array and hg_iface_tab_t for a (iface, concrete) pair.
@@ -274,9 +362,16 @@ func (e *Emitter) emitItabGlobal(pair ifacePair) {
 
 		var selfArg string
 		if concreteIsPtr && isNamed {
-			// data holds the pointer directly; cast to named type pointer
 			concreteCType := e.cTypeOf(named)
-			selfArg = fmt.Sprintf("(%s*)_self", concreteCType)
+			if isValueReceiver {
+				// Concrete is *T, but method declared on T (value receiver).
+				// The interface data holds the *T; dereference to pass T by value.
+				selfArg = fmt.Sprintf("*(%s*)_self", concreteCType)
+			} else {
+				// Concrete is *T, method declared on *T (pointer receiver).
+				// The interface data holds the *T directly.
+				selfArg = fmt.Sprintf("(%s*)_self", concreteCType)
+			}
 		} else if isNamed {
 			// data holds &value; value-receiver methods get a copy
 			concreteCType := e.cTypeOf(named)

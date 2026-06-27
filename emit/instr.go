@@ -73,6 +73,14 @@ func (pe *pkgEmitter) emitInstr(fn *ssa.Function, blk *ssa.BasicBlock, instr ssa
 			return
 		}
 		fieldName := st.Field(v.Field).Name()
+		// When the parent struct and the embedded field both map to the same
+		// C type (e.g. testing.T.common: both → hg_testing_T), the embedded
+		// field is at offset 0, so its address equals the struct pointer.
+		parentCT := pe.e.cTypeOf(v.X.Type())
+		if ct == parentCT {
+			fmt.Fprintf(b, "    %s %s = %s; /* embedded %s at offset 0 */\n", ct, valueName(v), xName, fieldName)
+			return
+		}
 		fmt.Fprintf(b, "    %s %s = &(%s)->%s;\n", ct, valueName(v), xName, fieldName)
 
 	case *ssa.Index:
@@ -306,14 +314,17 @@ func (pe *pkgEmitter) emitBinOp(v *ssa.BinOp, b *bytes.Buffer) {
 		if isString(v.X.Type().Underlying()) {
 			expr = fmt.Sprintf("hg_string_equal(%s, %s)", x, y)
 		} else if _, isIface := v.X.Type().Underlying().(*types.Interface); isIface {
-			// Interface equality: compare itab pointers (nil check is itab == NULL)
+			// Interface equality: nil checks compare itab; non-nil uses value comparison.
 			if isNilConst(v.Y) {
 				expr = fmt.Sprintf("(%s).itab == NULL", x)
 			} else if isNilConst(v.X) {
 				expr = fmt.Sprintf("(%s).itab == NULL", y)
 			} else {
-				expr = fmt.Sprintf("((%s).itab == (%s).itab && (%s).data == (%s).data)", x, y, x, y)
+				expr = fmt.Sprintf("hg_iface_equal(%s, %s)", x, y)
 			}
+		} else if _, isStruct := v.X.Type().Underlying().(*types.Struct); isStruct {
+			// C does not support struct == directly; use memcmp for comparable structs.
+			expr = fmt.Sprintf("(memcmp(&(%s), &(%s), sizeof(%s)) == 0)", x, y, x)
 		} else {
 			expr = fmt.Sprintf("%s == %s", x, y)
 		}
@@ -326,8 +337,11 @@ func (pe *pkgEmitter) emitBinOp(v *ssa.BinOp, b *bytes.Buffer) {
 			} else if isNilConst(v.X) {
 				expr = fmt.Sprintf("(%s).itab != NULL", y)
 			} else {
-				expr = fmt.Sprintf("((%s).itab != (%s).itab || (%s).data != (%s).data)", x, y, x, y)
+				expr = fmt.Sprintf("!hg_iface_equal(%s, %s)", x, y)
 			}
+		} else if _, isStruct := v.X.Type().Underlying().(*types.Struct); isStruct {
+			// C does not support struct != directly; use memcmp for comparable structs.
+			expr = fmt.Sprintf("(memcmp(&(%s), &(%s), sizeof(%s)) != 0)", x, y, x)
 		} else {
 			expr = fmt.Sprintf("%s != %s", x, y)
 		}
@@ -436,8 +450,34 @@ func (pe *pkgEmitter) emitCall(v *ssa.Call, b *bytes.Buffer) {
 				pe.emitFmtCall(fn.Name(), cc.Args, b)
 				return
 			}
+			// Functions with nil Package are builtins/wrappers; skip them safely.
+			if fn.Package() == nil {
+				// Handle slices.Sort / slices.IsSorted generic instantiations for known types.
+				// These are called by sort.Float64s, sort.Ints, sort.Strings wrappers.
+				if nilPkgSlicesSort(fn, v, cc.Args, b, pe) {
+					return
+				}
+				ct := v.Type()
+				if ct != nil && ct != types.Typ[types.Invalid] {
+					if _, isTuple := ct.(*types.Tuple); !isTuple {
+						cct := pe.e.cTypeOf(ct)
+						if cct != "" && cct != "void" && !strings.HasPrefix(cct, "/*") {
+							fmt.Fprintf(b, "    %s %s; memset(&%s, 0, sizeof(%s)); /* nil-pkg call %s */\n",
+								cct, valueName(v), valueName(v), valueName(v), fn.Name())
+							return
+						}
+					}
+				}
+				fmt.Fprintf(b, "    /* nil-pkg call %s */\n", fn.Name())
+				return
+			}
+			// testing.* → shim (must check before skipPkg)
+			if fn.Package().Pkg.Path() == "testing" {
+				pe.emitTestingCall(fn, v, cc.Args, b)
+				return
+			}
 			// errors.New → runtime shim (must check before skipPkg)
-			if fn.Package().Pkg.Path() == "errors" {
+			if fn.Package() != nil && fn.Package().Pkg.Path() == "errors" {
 				switch fn.Name() {
 				case "New":
 					ct := pe.e.cTypeOf(v.Type())
@@ -446,6 +486,57 @@ func (pe *pkgEmitter) emitCall(v *ssa.Call, b *bytes.Buffer) {
 					return
 				default:
 					fmt.Fprintf(b, "    /* call to errors.%s skipped */\n", fn.Name())
+					return
+				}
+			}
+			// math/bits → static inline shims in hagane_rt.h (before skipPkg)
+			if fn.Package() != nil && fn.Package().Pkg.Path() == "math/bits" {
+				if bitsCFn, ok := bitsMapping["math/bits."+fn.Name()]; ok {
+					args := pe.formatArgs(cc.Args)
+					ct := pe.e.cTypeOf(v.Type())
+					if ct == "" || ct == "void" || v.Type() == types.Typ[types.Invalid] {
+						fmt.Fprintf(b, "    %s(%s);\n", bitsCFn, args)
+					} else {
+						fmt.Fprintf(b, "    %s %s = (%s)%s(%s);\n", ct, valueName(v), ct, bitsCFn, args)
+					}
+					return
+				}
+			}
+			// math/rand/v2 → Xorshift64 shim for test PRNG
+			if fn.Package() != nil && fn.Package().Pkg.Path() == "math/rand/v2" {
+				fnName := fn.Name()
+				switch {
+				case fnName == "IntN" && fn.Signature.Recv() == nil:
+					// package-level rand.IntN(n)
+					ct := pe.e.cTypeOf(v.Type())
+					arg := pe.emitValue(cc.Args[0])
+					fmt.Fprintf(b, "    %s %s = hg_rand_intn(%s);\n", ct, valueName(v), arg)
+					return
+				case fnName == "New":
+					// rand.New(source) → allocate a dummy rand object
+					ct := pe.e.cTypeOf(v.Type())
+					if ct != "" && ct != "void" {
+						fmt.Fprintf(b, "    %s %s = hg_rand_New();\n", ct, valueName(v))
+					} else {
+						fmt.Fprintf(b, "    /* rand.New skipped */\n")
+					}
+					return
+				case fnName == "NewPCG" || fnName == "NewSource":
+					// rand.NewPCG(a, b) → zero, used only as arg to rand.New
+					ct := pe.e.cTypeOf(v.Type())
+					if ct != "" && ct != "void" {
+						fmt.Fprintf(b, "    %s %s; memset(&%s, 0, sizeof(%s)); /* rand.%s shim */\n",
+							ct, valueName(v), valueName(v), valueName(v), fnName)
+					} else {
+						fmt.Fprintf(b, "    /* rand.%s skipped */\n", fnName)
+					}
+					return
+				case fnName == "IntN" && fn.Signature.Recv() != nil:
+					// (*rand.Rand).IntN(n) method call; receiver is cc.Args[0]
+					ct := pe.e.cTypeOf(v.Type())
+					recv := pe.emitValue(cc.Args[0])
+					arg := pe.emitValue(cc.Args[1])
+					fmt.Fprintf(b, "    %s %s = hg_rand_Rand_IntN(%s, %s);\n", ct, valueName(v), recv, arg)
 					return
 				}
 			}
@@ -461,11 +552,13 @@ func (pe *pkgEmitter) emitCall(v *ssa.Call, b *bytes.Buffer) {
 				return
 			}
 			// skip calls to packages we don't transpile (init, etc.)
-			if skipPkg(fn.Package()) {
+			// Use isTranspiled (which honours the test-mode e.transpiled map) so that
+			// calls to test-only packages like sort_test are not skipped in test mode.
+			if !pe.e.isTranspiled(fn.Package().Pkg.Path()) {
 				t := v.Type()
 				if t != nil && t != types.Typ[types.Invalid] {
 					if _, isTuple := t.(*types.Tuple); !isTuple {
-						ct := pe.e.cTypeOf(t)
+						ct := pe.e.safeSkipCType(t)
 						if ct != "" && ct != "void" && !strings.HasPrefix(ct, "/*") {
 							fmt.Fprintf(b, "    %s %s; memset(&%s, 0, sizeof(%s)); /* %s.%s skipped */\n",
 								ct, valueName(v), valueName(v), valueName(v), fn.Package().Pkg.Path(), fn.Name())
@@ -1118,6 +1211,31 @@ func (pe *pkgEmitter) emitValue(v ssa.Value) string {
 		return "_env->" + sanitizeName(v.Name())
 	case *ssa.Parameter:
 		return paramName(v, 0) // best effort; index not available here
+	case *ssa.Function:
+		// Function value used as a first-class value (stored in a variable or passed as argument).
+		// Must emit the full qualified C name including package prefix, not just fn.Name(),
+		// and wrap in hg_func_t since Go functions-as-values carry a closure environment.
+		var cname string
+		pkg := v.Package()
+		if pkg == nil {
+			if obj := v.Object(); obj != nil && obj.Pkg() != nil {
+				cname = pkgCPrefix(obj.Pkg().Path()) + methodCBaseName(v)
+			}
+		} else {
+			cname = pkgCPrefix(pkg.Pkg.Path()) + methodCBaseName(v)
+		}
+		if cname == "" {
+			cname = sanitizeName(v.Name())
+		}
+		// Regular (non-closure) functions don't take a void* env as their first parameter,
+		// but function-value call sites always prepend env. When the function takes struct
+		// params by value, the extra env shifts all args and corrupts them. Emit a static
+		// trampoline that accepts (void* _hg_env, params...) and calls the real function.
+		fnPtr := cname
+		if v.Blocks != nil && len(v.FreeVars) == 0 {
+			fnPtr = pe.emitFuncTrampoline(cname, v.Signature)
+		}
+		return fmt.Sprintf("(hg_func_t){.fn=(void*)%s,.env=NULL}", fnPtr)
 	default:
 		return valueName(v)
 	}
@@ -1346,7 +1464,315 @@ func intSuffix(k types.BasicKind) string {
 	return ""
 }
 
+// ── testing package shim ──────────────────────────────────────────────────────
+
+// emitTestingCall translates a call to the testing package into a C shim call.
+// The receiver (first arg for method calls) is the hg_testing_T* pointer.
+func (pe *pkgEmitter) emitTestingCall(fn *ssa.Function, v *ssa.Call, args []ssa.Value, b *bytes.Buffer) {
+	name := fn.Name()
+
+	// testing.M.Run → int exit code (test main)
+	if name == "Run" {
+		ct := pe.e.cTypeOf(v.Type())
+		if len(args) >= 1 {
+			recv := pe.emitValue(args[0])
+			fmt.Fprintf(b, "    %s %s = hg_testing_M_Run(%s);\n", ct, valueName(v), recv)
+		}
+		return
+	}
+
+	// Method calls: args[0] is the receiver (*testing.T / *testing.common)
+	if len(args) == 0 {
+		// Emit a zero-value declaration for the result if it is used (e.g. testing.Short()).
+		if refs := v.Referrers(); refs != nil && len(*refs) > 0 {
+			ct := pe.e.cTypeOf(v.Type())
+			fmt.Fprintf(b, "    %s %s = 0; /* testing.%s: no args, skipped */\n", ct, valueName(v), name)
+		} else {
+			fmt.Fprintf(b, "    /* testing.%s: no args, skipped */\n", name)
+		}
+		return
+	}
+	recv := pe.emitValue(args[0])
+	rest := args[1:]
+
+	switch name {
+	case "Helper", "Parallel", "StartTimer", "StopTimer", "ResetTimer", "ReportAllocs":
+		fmt.Fprintf(b, "    hg_testing_%s(%s);\n", name, recv)
+	case "Cleanup":
+		if len(rest) >= 1 {
+			fmt.Fprintf(b, "    hg_testing_Cleanup(%s, %s);\n", recv, pe.emitValue(rest[0]))
+		}
+	case "Fail":
+		fmt.Fprintf(b, "    hg_testing_Fail(%s);\n", recv)
+	case "FailNow":
+		fmt.Fprintf(b, "    hg_testing_FailNow(%s);\n", recv)
+	case "Failed":
+		ct := pe.e.cTypeOf(v.Type())
+		fmt.Fprintf(b, "    %s %s = hg_testing_Failed(%s);\n", ct, valueName(v), recv)
+	case "Errorf":
+		if len(rest) >= 2 && isIfaceSlice(rest[1].Type()) {
+			fmt.Fprintf(b, "    hg_testing_Errorf(%s, %s, %s);\n",
+				recv, pe.emitValue(rest[0]), pe.emitValue(rest[1]))
+		} else if len(rest) >= 1 {
+			fmt.Fprintf(b, "    hg_testing_Errorf(%s, %s, HG_ZERO_SLICE(hg_slice_hg_iface_t_t));\n",
+				recv, pe.emitValue(rest[0]))
+		}
+	case "Fatalf":
+		if len(rest) >= 2 && isIfaceSlice(rest[1].Type()) {
+			fmt.Fprintf(b, "    hg_testing_Fatalf(%s, %s, %s);\n",
+				recv, pe.emitValue(rest[0]), pe.emitValue(rest[1]))
+		} else if len(rest) >= 1 {
+			fmt.Fprintf(b, "    hg_testing_Fatalf(%s, %s, HG_ZERO_SLICE(hg_slice_hg_iface_t_t));\n",
+				recv, pe.emitValue(rest[0]))
+		}
+	case "Logf":
+		if len(rest) >= 2 && isIfaceSlice(rest[1].Type()) {
+			fmt.Fprintf(b, "    hg_testing_Logf(%s, %s, %s);\n",
+				recv, pe.emitValue(rest[0]), pe.emitValue(rest[1]))
+		} else if len(rest) >= 1 {
+			fmt.Fprintf(b, "    hg_testing_Logf(%s, %s, HG_ZERO_SLICE(hg_slice_hg_iface_t_t));\n",
+				recv, pe.emitValue(rest[0]))
+		}
+	case "Skipf":
+		if len(rest) >= 2 && isIfaceSlice(rest[1].Type()) {
+			fmt.Fprintf(b, "    hg_testing_Skipf(%s, %s, %s);\n",
+				recv, pe.emitValue(rest[0]), pe.emitValue(rest[1]))
+		} else if len(rest) >= 1 {
+			fmt.Fprintf(b, "    hg_testing_Skipf(%s, %s, HG_ZERO_SLICE(hg_slice_hg_iface_t_t));\n",
+				recv, pe.emitValue(rest[0]))
+		}
+	case "Error":
+		if len(rest) >= 1 && isIfaceSlice(rest[0].Type()) {
+			fmt.Fprintf(b, "    hg_testing_Error(%s, %s);\n", recv, pe.emitValue(rest[0]))
+		} else {
+			fmt.Fprintf(b, "    hg_testing_Error(%s, HG_ZERO_SLICE(hg_slice_hg_iface_t_t));\n", recv)
+		}
+	case "Fatal":
+		if len(rest) >= 1 && isIfaceSlice(rest[0].Type()) {
+			fmt.Fprintf(b, "    hg_testing_Fatal(%s, %s);\n", recv, pe.emitValue(rest[0]))
+		} else {
+			fmt.Fprintf(b, "    hg_testing_Fatal(%s, HG_ZERO_SLICE(hg_slice_hg_iface_t_t));\n", recv)
+		}
+	case "Log":
+		if len(rest) >= 1 && isIfaceSlice(rest[0].Type()) {
+			fmt.Fprintf(b, "    hg_testing_Log(%s, %s);\n", recv, pe.emitValue(rest[0]))
+		} else {
+			fmt.Fprintf(b, "    hg_testing_Log(%s, HG_ZERO_SLICE(hg_slice_hg_iface_t_t));\n", recv)
+		}
+	case "Skip":
+		if len(rest) >= 1 && isIfaceSlice(rest[0].Type()) {
+			fmt.Fprintf(b, "    hg_testing_Skip(%s, %s);\n", recv, pe.emitValue(rest[0]))
+		} else {
+			fmt.Fprintf(b, "    hg_testing_Skip(%s, HG_ZERO_SLICE(hg_slice_hg_iface_t_t));\n", recv)
+		}
+	case "Run":
+		// T.Run(name, func(*T)) bool
+		ct := pe.e.cTypeOf(v.Type())
+		if len(rest) >= 2 {
+			fmt.Fprintf(b, "    %s %s = hg_testing_T_Run(%s, %s, %s);\n",
+				ct, valueName(v), recv, pe.emitValue(rest[0]), pe.emitValue(rest[1]))
+		}
+	default:
+		// Emit a zero-value declaration if the result is referenced (e.g. testing.AllocsPerRun).
+		if refs := v.Referrers(); refs != nil && len(*refs) > 0 {
+			ct := pe.e.cTypeOf(v.Type())
+			fmt.Fprintf(b, "    %s %s; memset(&%s, 0, sizeof(%s)); /* testing.%s: not implemented */\n",
+				ct, valueName(v), valueName(v), valueName(v), name)
+		} else {
+			fmt.Fprintf(b, "    /* testing.%s: not implemented */\n", name)
+		}
+	}
+}
+
+// emitFuncTrampoline emits (into hdrbuf) a static inline wrapper for a regular
+// function that accepts (void* _hg_env, original_params...) and calls the real
+// function. Returns the trampoline name. Trampolines fix the calling convention
+// mismatch when regular (non-closure) functions are stored in hg_func_t and
+// called via fn(env, args...) — the env shifts struct-by-value args otherwise.
+func (pe *pkgEmitter) emitFuncTrampoline(cname string, sig *types.Signature) string {
+	tname := cname + "_hgfv"
+	if pe.e.trampolines[tname] {
+		return tname
+	}
+	pe.e.trampolines[tname] = true
+
+	// Build return type.
+	var retC string
+	switch sig.Results().Len() {
+	case 0:
+		retC = "void"
+	case 1:
+		retC = pe.e.cTypeOf(sig.Results().At(0).Type())
+	default:
+		// multi-return: use existing ret struct name for this function
+		retC = retStructName(pe.prefix(), strings.TrimPrefix(tname, pe.prefix()))
+	}
+
+	// Build parameter list and call arg list.
+	var params, callArgs []string
+	params = append(params, "void* _hg_env")
+	for i := 0; i < sig.Params().Len(); i++ {
+		p := sig.Params().At(i)
+		ct := pe.e.cTypeOf(p.Type())
+		params = append(params, fmt.Sprintf("%s _p%d", ct, i))
+		callArgs = append(callArgs, fmt.Sprintf("_p%d", i))
+	}
+	paramStr := strings.Join(params, ", ")
+	callStr := strings.Join(callArgs, ", ")
+
+	if retC == "void" {
+		fmt.Fprintf(pe.e.hdrbuf, "static inline void %s(%s) { (void)_hg_env; %s(%s); }\n",
+			tname, paramStr, cname, callStr)
+	} else {
+		fmt.Fprintf(pe.e.hdrbuf, "static inline %s %s(%s) { (void)_hg_env; return %s(%s); }\n",
+			retC, tname, paramStr, cname, callStr)
+	}
+	return tname
+}
+
+// nilPkgSlicesShim handles nil-package generic calls from the slices package
+// (Sort, IsSorted, Clone, EqualFunc) for known primitive element types.
+// Returns true if handled. Called when the SSA function's Package() is nil.
+func nilPkgSlicesSort(fn *ssa.Function, v *ssa.Call, args []ssa.Value, b *bytes.Buffer, pe *pkgEmitter) bool {
+	name := fn.Name()
+
+	// Sort / IsSorted
+	var isSort, isIsSorted, isClone, isEqualFunc, isSortFunc bool
+	switch {
+	case strings.HasPrefix(name, "Sort["):
+		isSort = true
+	case strings.HasPrefix(name, "IsSorted["):
+		isIsSorted = true
+	case strings.HasPrefix(name, "Clone["):
+		isClone = true
+	case strings.HasPrefix(name, "EqualFunc["):
+		isEqualFunc = true
+	case strings.HasPrefix(name, "SortFunc["):
+		isSortFunc = true
+	default:
+		return false
+	}
+
+	if len(args) < 1 {
+		return false
+	}
+	argType := args[0].Type()
+	sl, ok := argType.(*types.Slice)
+	if !ok {
+		return false
+	}
+	elem := sl.Elem()
+
+	// SortFunc works for pointer element types without requiring basic elem.
+	if isSortFunc {
+		if _, isPtr := elem.(*types.Pointer); isPtr && len(args) >= 2 {
+			sliceArg := pe.emitValue(args[0])
+			cmpArg := pe.emitValue(args[1])
+			fmt.Fprintf(b, "    hg_slices_sortfunc_ptr((void**)%s.ptr, %s.len, %s);\n",
+				sliceArg, sliceArg, cmpArg)
+			return true
+		}
+		return false
+	}
+
+	basic, ok := elem.(*types.Basic)
+	if !ok {
+		return false
+	}
+
+	switch {
+	case isSort:
+		var sortFn string
+		switch basic.Kind() {
+		case types.Float64:
+			sortFn = "hg_slices_sort_f64"
+		case types.Int, types.Int64:
+			sortFn = "hg_slices_sort_i64"
+		case types.String:
+			sortFn = "hg_slices_sort_str"
+		default:
+			return false
+		}
+		fmt.Fprintf(b, "    %s(%s);\n", sortFn, pe.emitValue(args[0]))
+		return true
+
+	case isIsSorted:
+		var fn string
+		switch basic.Kind() {
+		case types.Float64:
+			fn = "hg_slices_issorted_f64"
+		case types.Int, types.Int64:
+			fn = "hg_slices_issorted_i64"
+		case types.String:
+			fn = "hg_slices_issorted_str"
+		default:
+			return false
+		}
+		ct := pe.e.cTypeOf(v.Type())
+		fmt.Fprintf(b, "    %s %s = %s(%s);\n", ct, valueName(v), fn, pe.emitValue(args[0]))
+		return true
+
+	case isClone:
+		var fn string
+		switch basic.Kind() {
+		case types.Float64:
+			fn = "hg_slices_clone_f64"
+		case types.Int, types.Int64:
+			fn = "hg_slices_clone_i64"
+		default:
+			return false
+		}
+		ct := pe.e.cTypeOf(v.Type())
+		fmt.Fprintf(b, "    %s %s = %s(%s);\n", ct, valueName(v), fn, pe.emitValue(args[0]))
+		return true
+
+	case isEqualFunc:
+		if len(args) < 3 {
+			return false
+		}
+		var fn string
+		switch basic.Kind() {
+		case types.Float64:
+			fn = "hg_slices_equalfunc_f64"
+		default:
+			return false
+		}
+		ct := pe.e.cTypeOf(v.Type())
+		a0, a1, a2 := pe.emitValue(args[0]), pe.emitValue(args[1]), pe.emitValue(args[2])
+		fmt.Fprintf(b, "    %s %s = %s(%s, %s, %s);\n", ct, valueName(v), fn, a0, a1, a2)
+		return true
+
+	}
+	return false
+}
+
 // ── math package mapping ──────────────────────────────────────────────────────
+
+// bitsMapping maps "math/bits.FuncName" → C shim name in hagane_rt.h.
+var bitsMapping = map[string]string{
+	"math/bits.Len":            "hg_bits_Len",
+	"math/bits.Len8":           "hg_bits_Len8",
+	"math/bits.Len16":          "hg_bits_Len16",
+	"math/bits.Len32":          "hg_bits_Len32",
+	"math/bits.Len64":          "hg_bits_Len64",
+	"math/bits.OnesCount":      "hg_bits_OnesCount",
+	"math/bits.OnesCount8":     "hg_bits_OnesCount8",
+	"math/bits.OnesCount16":    "hg_bits_OnesCount16",
+	"math/bits.OnesCount32":    "hg_bits_OnesCount32",
+	"math/bits.OnesCount64":    "hg_bits_OnesCount64",
+	"math/bits.TrailingZeros":  "hg_bits_TrailingZeros",
+	"math/bits.TrailingZeros8": "hg_bits_TrailingZeros8",
+	"math/bits.TrailingZeros16":"hg_bits_TrailingZeros16",
+	"math/bits.TrailingZeros32":"hg_bits_TrailingZeros32",
+	"math/bits.TrailingZeros64":"hg_bits_TrailingZeros64",
+	"math/bits.LeadingZeros":   "hg_bits_LeadingZeros",
+	"math/bits.LeadingZeros8":  "hg_bits_LeadingZeros8",
+	"math/bits.LeadingZeros16": "hg_bits_LeadingZeros16",
+	"math/bits.LeadingZeros32": "hg_bits_LeadingZeros32",
+	"math/bits.LeadingZeros64": "hg_bits_LeadingZeros64",
+	"math/bits.RotateLeft":     "hg_bits_RotateLeft",
+	"math/bits.RotateLeft32":   "hg_bits_RotateLeft32",
+}
 
 // mathMapping maps "math.FuncName" → C math.h function name.
 var mathMapping = map[string]string{
@@ -1651,7 +2077,8 @@ func (pe *pkgEmitter) emitNextType(t0, t1 string) string {
 	name := fmt.Sprintf("hg_tup_%s_%s_t", mangle(t0), mangle(t1))
 	if !pe.e.nextTypes[name] {
 		pe.e.nextTypes[name] = true
-		fmt.Fprintf(pe.e.hdrbuf, "typedef struct { %s r0; %s r1; } %s;\n", t0, t1, name)
+		g := "HG_TYPEDEF_" + strings.ToUpper(mangle(name))
+		fmt.Fprintf(pe.e.hdrbuf, "#ifndef %s\n#define %s\ntypedef struct { %s r0; %s r1; } %s;\n#endif\n", g, g, t0, t1, name)
 	}
 	return name
 }
@@ -1661,7 +2088,8 @@ func (pe *pkgEmitter) emitNextType3(t0, t1, t2 string) string {
 	name := fmt.Sprintf("hg_tup3_%s_%s_%s_t", mangle(t0), mangle(t1), mangle(t2))
 	if !pe.e.nextTypes[name] {
 		pe.e.nextTypes[name] = true
-		fmt.Fprintf(pe.e.hdrbuf, "typedef struct { %s r0; %s r1; %s r2; } %s;\n", t0, t1, t2, name)
+		g := "HG_TYPEDEF_" + strings.ToUpper(mangle(name))
+		fmt.Fprintf(pe.e.hdrbuf, "#ifndef %s\n#define %s\ntypedef struct { %s r0; %s r1; %s r2; } %s;\n#endif\n", g, g, t0, t1, t2, name)
 	}
 	return name
 }

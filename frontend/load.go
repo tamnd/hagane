@@ -4,6 +4,7 @@ package frontend
 import (
 	"fmt"
 	"go/token"
+	"strings"
 
 	"golang.org/x/tools/go/packages"
 	"golang.org/x/tools/go/ssa"
@@ -61,7 +62,7 @@ func Load(cfg *Config) (*Program, error) {
 
 	// Build SSA. SanityCheckFunctions validates the SSA invariants.
 	mode := ssa.SanityCheckFunctions | ssa.InstantiateGenerics
-	prog, _ := ssautil.AllPackages(pkgs, mode)
+	prog, ssaPkgs := ssautil.AllPackages(pkgs, mode)
 	prog.Build()
 
 	// Collect ALL packages (root + transitive imports) in post-order so
@@ -84,9 +85,44 @@ func Load(cfg *Config) (*Program, error) {
 		}
 	})
 
+	// When loading with Tests: true, ssautil.AllPackages also returns test and
+	// test-binary packages that packages.Visit may not reach via the import graph.
+	// Append any that we haven't already seen. If a package path is already in
+	// all but a later ssaPkg with the same path has test functions, replace it
+	// so the test-augmented version (which carries internal test functions) wins.
+	if cfg.Tests {
+		for _, sp := range ssaPkgs {
+			if sp == nil {
+				continue
+			}
+			path := sp.Pkg.Path()
+			if !seen[path] {
+				seen[path] = true
+				all = append(all, sp)
+				continue
+			}
+			// path already seen — promote this package if it has Test* members
+			hasTests := false
+			for name := range sp.Members {
+				if strings.HasPrefix(name, "Test") {
+					hasTests = true
+					break
+				}
+			}
+			if hasTests {
+				for i, existing := range all {
+					if existing != nil && existing.Pkg.Path() == path {
+						all[i] = sp
+						break
+					}
+				}
+			}
+		}
+	}
+
 	var mainPkg *ssa.Package
 	for _, p := range all {
-		if p != nil && p.Pkg.Name() == "main" {
+		if p != nil && p.Pkg.Name() == "main" && !strings.HasSuffix(p.Pkg.Path(), ".test") {
 			mainPkg = p
 			break
 		}

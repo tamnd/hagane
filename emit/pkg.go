@@ -74,29 +74,48 @@ func (pe *pkgEmitter) emitHeader() {
 		}
 	}
 
+	// Emit non-struct type aliases first (slices, basics, funcs, etc.) so that
+	// struct bodies that reference these aliases see them already defined.
 	for _, name := range typeNames {
 		tp := pe.pkg.Members[name].(*ssa.Type)
 		named, ok := tp.Type().(*types.Named)
 		if !ok {
 			continue
 		}
-		cname := pe.e.cTypeNamed(named)
-		switch st := named.Underlying().(type) {
-		case *types.Struct:
-			// Use the struct tag (same name as typedef) so forward declarations work.
-			fmt.Fprintf(h, "struct %s {\n", cname)
-			for i := 0; i < st.NumFields(); i++ {
-				f := st.Field(i)
-				ft := pe.e.cTypeOf(f.Type())
-				fmt.Fprintf(h, "    %s %s;\n", ft, f.Name())
-			}
-			fmt.Fprintf(h, "};\n")
-		default:
-			// Named alias over a non-struct type (array, basic, etc.).
-			// cTypeInner will register any needed array typedefs in hdrbuf.
-			underlying := pe.e.cTypeInner(named.Underlying())
-			fmt.Fprintf(h, "typedef %s %s;\n", underlying, cname)
+		if _, ok := named.Underlying().(*types.Struct); ok {
+			continue // handled in the next pass
 		}
+		cname := pe.e.cTypeNamed(named)
+		underlying := pe.e.cTypeInner(named.Underlying())
+		fmt.Fprintf(h, "typedef %s %s;\n", underlying, cname)
+	}
+
+	// Emit struct bodies second (after all aliases and slice typedefs are defined).
+	// We buffer each struct body separately because cTypeOf() may write additional
+	// slice typedefs to hdrbuf as a side effect — those must land before the body,
+	// not inside it.
+	for _, name := range typeNames {
+		tp := pe.pkg.Members[name].(*ssa.Type)
+		named, ok := tp.Type().(*types.Named)
+		if !ok {
+			continue
+		}
+		st, ok := named.Underlying().(*types.Struct)
+		if !ok {
+			continue
+		}
+		cname := pe.e.cTypeNamed(named)
+		var bodyBuf bytes.Buffer
+		fmt.Fprintf(&bodyBuf, "struct %s {\n", cname)
+		for i := 0; i < st.NumFields(); i++ {
+			f := st.Field(i)
+			// cTypeOf may write slice typedefs to hdrbuf (h) here — that is intentional.
+			// Those writes land before bodyBuf is flushed, ensuring correct C ordering.
+			ft := pe.e.cTypeOf(f.Type())
+			fmt.Fprintf(&bodyBuf, "    %s %s;\n", ft, f.Name())
+		}
+		fmt.Fprintf(&bodyBuf, "};\n")
+		h.Write(bodyBuf.Bytes())
 	}
 
 	// Collect function members in sorted order for deterministic output.
@@ -178,10 +197,17 @@ func (pe *pkgEmitter) emitClosureEnv(fn *ssa.Function) string {
 		return name
 	}
 	pe.e.mapFuncs[name] = true
+	// Compute field C types BEFORE opening the struct body.
+	// cTypeOf may write side effects (anonymous struct typedefs, slice typedefs)
+	// to hdrbuf; those writes must appear before the typedef struct { ... } body.
+	type envField struct{ ct, nm string }
+	fields := make([]envField, len(fn.FreeVars))
+	for i, fv := range fn.FreeVars {
+		fields[i] = envField{pe.e.cTypeOf(fv.Type()), sanitizeName(fv.Name())}
+	}
 	fmt.Fprintf(pe.e.hdrbuf, "typedef struct {\n")
-	for _, fv := range fn.FreeVars {
-		ct := pe.e.cTypeOf(fv.Type())
-		fmt.Fprintf(pe.e.hdrbuf, "    %s %s;\n", ct, sanitizeName(fv.Name()))
+	for _, f := range fields {
+		fmt.Fprintf(pe.e.hdrbuf, "    %s %s;\n", f.ct, f.nm)
 	}
 	fmt.Fprintf(pe.e.hdrbuf, "} %s;\n", name)
 	return name

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"fmt"
 	"go/token"
+	"go/types"
 	"io"
 	"os"
 	"path/filepath"
@@ -19,36 +20,39 @@ import (
 
 // Emitter holds state for emitting one Go package as C.
 type Emitter struct {
-	prog       *frontend.Program
-	pkg        *ssa.Package
-	fset       *token.FileSet
-	buf        *bytes.Buffer
-	hdrbuf     *bytes.Buffer // header (forward decls)
-	sliceTypes map[string]bool
-	mapTypes   map[string]bool
-	nextTypes  map[string]bool      // Next result tuple typedefs already emitted
-	mapFuncs   map[string]bool      // hash/eq helper function names already emitted
-	ifacePairs map[string]ifacePair // (concrete, iface) pairs for M3 itab emission
-	transpiled map[string]bool      // paths of packages being emitted as C
+	prog            *frontend.Program
+	pkg             *ssa.Package
+	fset            *token.FileSet
+	buf             *bytes.Buffer
+	hdrbuf          *bytes.Buffer // header (forward decls)
+	sliceTypes      map[string]bool
+	mapTypes        map[string]bool
+	nextTypes       map[string]bool      // Next result tuple typedefs already emitted
+	mapFuncs        map[string]bool      // hash/eq helper function names already emitted
+	ifacePairs      map[string]ifacePair // (concrete, iface) pairs for M3 itab emission
+	transpiled      map[string]bool      // paths of packages being emitted as C
+	anonStructNames map[string]string    // Go struct string → C typedef name
+	trampolines     map[string]bool      // trampoline names already emitted (for func values)
 }
 
 // rtSliceTypes lists slice typedefs already defined in hagane_rt.h so we don't re-emit them.
 var rtSliceTypes = map[string]bool{
-	"hg_slice_bool_t":        true,
-	"hg_slice_int8_t":        true,
-	"hg_slice_int16_t":       true,
-	"hg_slice_int32_t":       true,
-	"hg_slice_int64_t":       true,
-	"hg_slice_uint8_t":       true,
-	"hg_slice_uint16_t":      true,
-	"hg_slice_uint32_t":      true,
-	"hg_slice_uint64_t":      true,
-	"hg_slice_uintptr_t":     true,
-	"hg_slice_float_t":       true,
-	"hg_slice_double_t":      true,
-	"hg_slice_hg_string_t_t": true,
-	"hg_slice_hg_iface_t_t":  true,
-	"hg_slice_voidptr_t":     true,
+	"hg_slice_bool_t":              true,
+	"hg_slice_int8_t":              true,
+	"hg_slice_int16_t":             true,
+	"hg_slice_int32_t":             true,
+	"hg_slice_int64_t":             true,
+	"hg_slice_uint8_t":             true,
+	"hg_slice_uint16_t":            true,
+	"hg_slice_uint32_t":            true,
+	"hg_slice_uint64_t":            true,
+	"hg_slice_uintptr_t":           true,
+	"hg_slice_float_t":             true,
+	"hg_slice_double_t":            true,
+	"hg_slice_hg_string_t_t":       true,
+	"hg_slice_hg_iface_t_t":        true,
+	"hg_slice_voidptr_t":           true,
+	"hg_slice_hg_anon_struct_t_t":  true,
 }
 
 // New creates an Emitter for the given loaded program.
@@ -59,14 +63,15 @@ func New(prog *frontend.Program) *Emitter {
 		st[k] = v
 	}
 	return &Emitter{
-		prog:       prog,
-		fset:       prog.Fset,
-		sliceTypes: st,
-		mapTypes:   make(map[string]bool),
-		nextTypes:  make(map[string]bool),
-		mapFuncs:   make(map[string]bool),
-		ifacePairs: make(map[string]ifacePair),
-		transpiled: make(map[string]bool),
+		prog:            prog,
+		fset:            prog.Fset,
+		sliceTypes:      st,
+		mapTypes:        make(map[string]bool),
+		nextTypes:       make(map[string]bool),
+		mapFuncs:        make(map[string]bool),
+		ifacePairs:      make(map[string]ifacePair),
+		transpiled:      make(map[string]bool),
+		anonStructNames: make(map[string]string),
 	}
 }
 
@@ -185,11 +190,67 @@ func (e *Emitter) runEmitPkg(pkg *ssa.Package) error {
 	e.nextTypes = make(map[string]bool)
 	e.mapFuncs = make(map[string]bool)
 	e.ifacePairs = make(map[string]ifacePair)
+	e.trampolines = make(map[string]bool)
 
-	// collect all functions in this package (including methods) via AllFunctions
+	// collect all functions in this package (including methods) via AllFunctions.
+	// Synthetic wrapper functions for promoted/pointer methods have fn.Package() == nil,
+	// but their Object().Pkg() points to this package.
+	// We only include those wrappers for PROMOTED methods (not for pointer wrappers of
+	// direct value-receiver methods, which would collide with the real declaration).
+	//
+	// When loading with Tests: true, Go may create a test-augmented variant of a package
+	// (e.g. sort [sort.test]) that includes export_test.go functions like sort.ReverseRange.
+	// Those functions have fn.Package() != pkg (different *ssa.Package identity) but the
+	// same import path. We include them to ensure exported test helpers land in the header.
+	pkgPath := pkg.Pkg.Path()
+	seenFns := map[string]bool{}
 	var fns []*ssa.Function
 	for fn := range ssautil.AllFunctions(e.prog.SSA) {
-		if fn.Package() == pkg && fn.Blocks != nil {
+		if fn.Blocks == nil {
+			continue
+		}
+		// Skip anonymous functions (closures): collected via collectAnon from their
+		// top-level parent below. If we also collect them here, both the regular and
+		// test-augmented package variants (e.g. sort / sort [sort.test]) contribute
+		// closures under the same C name, causing redefinition errors.
+		if fn.Parent() != nil {
+			continue
+		}
+		fnPkg := fn.Package()
+		if fnPkg != nil {
+			// Match by identity first; fall back to path match for test-augmented packages
+			// (e.g. sort [sort.test] which includes export_test.go functions like ReverseRange).
+			if fnPkg == pkg || fnPkg.Pkg.Path() == pkgPath {
+				cname := pkgCPrefix(pkgPath) + methodCBaseName(fn)
+				if !seenFns[cname] {
+					seenFns[cname] = true
+					fns = append(fns, fn)
+				}
+			}
+			continue
+		}
+		// fnPkg is nil: synthetic wrapper generated by SSA (promoted/pointer method wrapper).
+		// These wrappers have short generic names like "Len", "Less", "Swap" — not unique
+		// across types. Do not check seenFns here (which uses fn.Name() as key); instead
+		// check the full receiver-qualified C name after emission to avoid duplicates.
+		obj := fn.Object()
+		if obj == nil || obj.Pkg() != pkg.Pkg {
+			continue
+		}
+		// Skip (*T).M wrappers when T directly declares M as value receiver
+		// (that function is already emitted; the itab will dereference when calling it).
+		if isPointerWrapperForDirectMethod(fn) {
+			continue
+		}
+		// Skip value-receiver (T).M wrappers for promoted (not directly declared) methods.
+		// The pointer-receiver (*T).M wrapper for the same promoted method will be emitted
+		// instead, giving a consistent pointer-based C signature for itab dispatch.
+		if isValueWrapperForPromotedMethod(fn) {
+			continue
+		}
+		cname := pkgCPrefix(pkgPath) + methodCBaseName(fn)
+		if !seenFns[cname] {
+			seenFns[cname] = true
 			fns = append(fns, fn)
 		}
 	}
@@ -198,14 +259,27 @@ func (e *Emitter) runEmitPkg(pkg *ssa.Package) error {
 	})
 
 	// expand to include anonymous functions (closures)
+	// Use pointer-based dedup (anonPtrSeen) for recursion safety and C-name dedup
+	// (allFnsCnames) to avoid emitting the same closure from two package variants.
 	var allFns []*ssa.Function
+	allFnsCnames := map[string]bool{}
 	var collectAnon func(fn *ssa.Function)
-	anonSeen := map[*ssa.Function]bool{}
+	anonPtrSeen := map[*ssa.Function]bool{}
 	collectAnon = func(fn *ssa.Function) {
-		if anonSeen[fn] {
+		if anonPtrSeen[fn] {
 			return
 		}
-		anonSeen[fn] = true
+		anonPtrSeen[fn] = true
+		cname := pkgCPrefix(pkgPath) + methodCBaseName(fn)
+		if allFnsCnames[cname] {
+			// Already have a function with this C name; still recurse into AnonFuncs
+			// in case they expand into closures not yet seen.
+			for _, anon := range fn.AnonFuncs {
+				collectAnon(anon)
+			}
+			return
+		}
+		allFnsCnames[cname] = true
 		allFns = append(allFns, fn)
 		for _, anon := range fn.AnonFuncs {
 			collectAnon(anon)
@@ -219,17 +293,27 @@ func (e *Emitter) runEmitPkg(pkg *ssa.Package) error {
 	pe := &pkgEmitter{e: e, pkg: pkg}
 	pe.emitHeader()
 
-	// emit prototypes for anonymous functions (not in pkg.Members)
+	// Build the set of C names already declared by emitHeader (pkg.Members top-level funcs).
+	memberCnames := map[string]bool{}
+	for _, mem := range pkg.Members {
+		if fn, ok := mem.(*ssa.Function); ok && fn.Blocks != nil {
+			memberCnames[pkgCPrefix(pkgPath)+methodCBaseName(fn)] = true
+		}
+	}
+
+	// emit prototypes for methods, test-augmented functions, and anonymous functions
+	// that are NOT already declared by emitHeader. The old check used fn.Name() as
+	// the pkg.Members key, which wrongly matched methods against top-level functions
+	// of the same bare name (e.g. IntSlice.Search vs sort.Search both return "Search").
 	for _, fn := range allFns {
 		if fn.Blocks == nil {
 			continue
 		}
-		if _, inMembers := pkg.Members[fn.Name()]; inMembers {
-			continue // top-level already emitted by emitHeader
+		cname := pkgCPrefix(pkgPath) + methodCBaseName(fn)
+		if memberCnames[cname] {
+			continue // already emitted by emitHeader
 		}
-		// anon func prototype
 		if len(fn.FreeVars) > 0 {
-			// env struct must be emitted before the prototype
 			pe.emitClosureEnv(fn)
 		}
 		if fn.Signature.Results().Len() > 1 {
@@ -272,6 +356,7 @@ var transpilableStdlib = map[string]bool{
 	"container/heap": true,
 	"container/list": true,
 	"container/ring": true,
+	"sort":           true,
 }
 
 func skipPkg(pkg *ssa.Package) bool {
@@ -287,6 +372,58 @@ func skipPkg(pkg *ssa.Package) bool {
 	}
 	// For stdlib, only emit packages in the explicit allowlist.
 	return !transpilableStdlib[path]
+}
+
+// isValueWrapperForPromotedMethod returns true when fn is a synthetic (T).Method
+// wrapper generated for a promoted (embedded) method that T does not declare directly.
+// We skip these in favor of the pointer-receiver (*T).Method wrapper, which has a
+// consistent pointer-based C signature for itab dispatch.
+func isValueWrapperForPromotedMethod(fn *ssa.Function) bool {
+	recv := fn.Signature.Recv()
+	if recv == nil {
+		return false
+	}
+	if _, ok := recv.Type().(*types.Pointer); ok {
+		return false // not a value receiver wrapper
+	}
+	named, ok := recv.Type().(*types.Named)
+	if !ok {
+		return false
+	}
+	methodName := fn.Object().Name()
+	for i := 0; i < named.NumMethods(); i++ {
+		if named.Method(i).Name() == methodName {
+			return false // directly declared — not a promoted wrapper
+		}
+	}
+	return true
+}
+
+// isPointerWrapperForDirectMethod returns true when fn is a synthetic (*T).Method
+// wrapper generated because T has a direct value-receiver Method declaration.
+// In that case, the value-receiver function is already emitted with the same
+// C name and we should skip the pointer wrapper to avoid conflicting declarations.
+func isPointerWrapperForDirectMethod(fn *ssa.Function) bool {
+	recv := fn.Signature.Recv()
+	if recv == nil {
+		return false
+	}
+	ptr, ok := recv.Type().(*types.Pointer)
+	if !ok {
+		return false
+	}
+	named, ok := ptr.Elem().(*types.Named)
+	if !ok {
+		return false
+	}
+	methodName := fn.Object().Name()
+	for i := 0; i < named.NumMethods(); i++ {
+		if named.Method(i).Name() == methodName {
+			// T has this method declared directly — the pointer wrapper is redundant.
+			return true
+		}
+	}
+	return false
 }
 
 func pkgToFileName(path string) string {

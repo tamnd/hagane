@@ -52,6 +52,11 @@ typedef struct { void       **ptr; int64_t len; int64_t cap; } hg_slice_voidptr_
 /* ── generic raw slice (for runtime reflection) ──────────────────────────── */
 typedef struct { void *ptr; int64_t len; int64_t cap; } hg_rawslice_t;
 
+/* ── anonymous struct placeholder ────────────────────────────────────────── */
+/* Used when a struct type can't be fully resolved (skipped packages, etc.) */
+typedef struct { void *_hg_placeholder; } hg_anon_struct_t;
+typedef struct { hg_anon_struct_t *ptr; int64_t len; int64_t cap; } hg_slice_hg_anon_struct_t_t;
+
 /* ── safety checks ───────────────────────────────────────────────────────── */
 #define hg_bounds_check(idx, len, file, line) do { \
     if ((uint64_t)(idx) >= (uint64_t)(len)) { \
@@ -200,6 +205,52 @@ extern const hg_iface_tab_t hg_itab_uintptr;
 static inline double hg_math_inf(int sign) { return sign >= 0 ? (1.0/0.0) : -(1.0/0.0); }
 static inline double hg_math_nan(void)     { return 0.0/0.0; }
 
+/* ── slices.Sort / slices.IsSorted shims ─────────────────────────────────── *
+ * Called by emitted code when slices.Sort/IsSorted generic instantiations   *
+ * are encountered for primitive element types.                               */
+static int _hg_cmp_f64(const void *a, const void *b) {
+    double x = *(const double*)a, y = *(const double*)b;
+    return (x > y) - (x < y);
+}
+static int _hg_cmp_i64(const void *a, const void *b) {
+    int64_t x = *(const int64_t*)a, y = *(const int64_t*)b;
+    return (x > y) - (x < y);
+}
+static int _hg_cmp_str(const void *a, const void *b) {
+    const hg_string_t *x = (const hg_string_t*)a, *y = (const hg_string_t*)b;
+    int64_t n = x->len < y->len ? x->len : y->len;
+    int r = memcmp(x->ptr, y->ptr, (size_t)n);
+    if (r != 0) return r;
+    return (x->len > y->len) - (x->len < y->len);
+}
+static inline void hg_slices_sort_f64(hg_slice_double_t s) {
+    qsort(s.ptr, (size_t)s.len, sizeof(double), _hg_cmp_f64);
+}
+static inline void hg_slices_sort_i64(hg_slice_int64_t s) {
+    qsort(s.ptr, (size_t)s.len, sizeof(int64_t), _hg_cmp_i64);
+}
+static inline void hg_slices_sort_str(hg_slice_hg_string_t_t s) {
+    qsort(s.ptr, (size_t)s.len, sizeof(hg_string_t), _hg_cmp_str);
+}
+static inline bool hg_slices_issorted_f64(hg_slice_double_t s) {
+    for (int64_t i = 1; i < s.len; i++) {
+        if (s.ptr[i] < s.ptr[i-1]) return false;
+    }
+    return true;
+}
+static inline bool hg_slices_issorted_i64(hg_slice_int64_t s) {
+    for (int64_t i = 1; i < s.len; i++) {
+        if (s.ptr[i] < s.ptr[i-1]) return false;
+    }
+    return true;
+}
+static inline bool hg_slices_issorted_str(hg_slice_hg_string_t_t s) {
+    for (int64_t i = 1; i < s.len; i++) {
+        if (_hg_cmp_str(&s.ptr[i], &s.ptr[i-1]) < 0) return false;
+    }
+    return true;
+}
+
 /* ── defer runtime ───────────────────────────────────────────────────────── */
 typedef struct hg_defer_s {
     struct hg_defer_s *next;
@@ -253,9 +304,86 @@ void         hg_throw(hg_iface_t val);
 hg_iface_t   hg_recover(void);
 void         hg_repanic(void);
 
+/* math/bits shim — used by sort and other packages */
+static inline int64_t hg_bits_Len(uint64_t x) {
+    return x == 0 ? 0 : (int64_t)(64 - __builtin_clzll((unsigned long long)x));
+}
+static inline int64_t hg_bits_Len8(uint8_t x)  {
+    return x == 0 ? 0 : (int64_t)(8  - __builtin_clz((unsigned int)x) - 24);
+}
+static inline int64_t hg_bits_Len16(uint16_t x) {
+    return x == 0 ? 0 : (int64_t)(16 - __builtin_clz((unsigned int)x) - 16);
+}
+static inline int64_t hg_bits_Len32(uint32_t x) {
+    return x == 0 ? 0 : (int64_t)(32 - __builtin_clz((unsigned int)x));
+}
+static inline int64_t hg_bits_Len64(uint64_t x) {
+    return x == 0 ? 0 : (int64_t)(64 - __builtin_clzll((unsigned long long)x));
+}
+static inline int64_t hg_bits_OnesCount(uint64_t x)   { return (int64_t)__builtin_popcountll(x); }
+static inline int64_t hg_bits_OnesCount8(uint8_t x)   { return (int64_t)__builtin_popcount(x); }
+static inline int64_t hg_bits_OnesCount16(uint16_t x) { return (int64_t)__builtin_popcount(x); }
+static inline int64_t hg_bits_OnesCount32(uint32_t x) { return (int64_t)__builtin_popcount(x); }
+static inline int64_t hg_bits_OnesCount64(uint64_t x) { return (int64_t)__builtin_popcountll(x); }
+static inline int64_t hg_bits_TrailingZeros(uint64_t x)   { return x == 0 ? 64 : (int64_t)__builtin_ctzll(x); }
+static inline int64_t hg_bits_TrailingZeros8(uint8_t x)   { return x == 0 ? 8  : (int64_t)__builtin_ctz(x); }
+static inline int64_t hg_bits_TrailingZeros16(uint16_t x) { return x == 0 ? 16 : (int64_t)__builtin_ctz(x); }
+static inline int64_t hg_bits_TrailingZeros32(uint32_t x) { return x == 0 ? 32 : (int64_t)__builtin_ctz(x); }
+static inline int64_t hg_bits_TrailingZeros64(uint64_t x) { return x == 0 ? 64 : (int64_t)__builtin_ctzll(x); }
+static inline int64_t hg_bits_LeadingZeros(uint64_t x)   { return x == 0 ? 64 : (int64_t)__builtin_clzll(x); }
+static inline int64_t hg_bits_LeadingZeros8(uint8_t x)   { return x == 0 ? 8  : (int64_t)__builtin_clz(x) - 24; }
+static inline int64_t hg_bits_LeadingZeros16(uint16_t x) { return x == 0 ? 16 : (int64_t)__builtin_clz(x) - 16; }
+static inline int64_t hg_bits_LeadingZeros32(uint32_t x) { return x == 0 ? 32 : (int64_t)__builtin_clz(x); }
+static inline int64_t hg_bits_LeadingZeros64(uint64_t x) { return x == 0 ? 64 : (int64_t)__builtin_clzll(x); }
+static inline uint64_t hg_bits_RotateLeft(uint64_t x, int k) {
+    unsigned s = (unsigned)k & 63;
+    return (x << s) | (x >> (64 - s));
+}
+static inline uint32_t hg_bits_RotateLeft32(uint32_t x, int k) {
+    unsigned s = (unsigned)k & 31;
+    return (x << s) | (x >> (32 - s));
+}
+static inline void hg_bits_init(void) {}
+
 /* errors shim */
 hg_iface_t hg_errors_New(hg_string_t msg);
 static inline void hg_errors_init(void) {}
+
+/* testing shim — covers testing.T and testing.B (both map to this struct) */
+typedef struct hg_testing_T {
+    bool               failed;
+    bool               skipped;
+    bool               has_failnow;
+    hg_string_t        name;
+    struct hg_testing_T *parent;
+    jmp_buf            failnow_jmp;
+    int64_t            N; /* testing.B.N — number of benchmark iterations */
+} hg_testing_T;
+
+void hg_testing_Errorf(hg_testing_T *t, hg_string_t fmt, hg_slice_hg_iface_t_t args);
+void hg_testing_Logf(hg_testing_T *t, hg_string_t fmt, hg_slice_hg_iface_t_t args);
+void hg_testing_Fatal(hg_testing_T *t, hg_slice_hg_iface_t_t args);
+void hg_testing_Fatalf(hg_testing_T *t, hg_string_t fmt, hg_slice_hg_iface_t_t args);
+void hg_testing_Error(hg_testing_T *t, hg_slice_hg_iface_t_t args);
+void hg_testing_Log(hg_testing_T *t, hg_slice_hg_iface_t_t args);
+void hg_testing_Fail(hg_testing_T *t);
+void hg_testing_FailNow(hg_testing_T *t);
+bool hg_testing_Failed(hg_testing_T *t);
+void hg_testing_Skip(hg_testing_T *t, hg_slice_hg_iface_t_t args);
+void hg_testing_Skipf(hg_testing_T *t, hg_string_t fmt, hg_slice_hg_iface_t_t args);
+static inline void hg_testing_Helper(hg_testing_T *t) { (void)t; }
+static inline void hg_testing_Parallel(hg_testing_T *t) { (void)t; }
+static inline void hg_testing_StartTimer(hg_testing_T *t) { (void)t; }
+static inline void hg_testing_StopTimer(hg_testing_T *t) { (void)t; }
+static inline void hg_testing_ResetTimer(hg_testing_T *t) { (void)t; }
+static inline void hg_testing_ReportAllocs(hg_testing_T *t) { (void)t; }
+bool hg_testing_T_Run(hg_testing_T *t, hg_string_t name, hg_func_t fn);
+static inline void hg_testing_init(void) {}
+static inline void hg_testing_Cleanup(hg_testing_T *t, hg_func_t fn) { (void)t; (void)fn; }
+
+/* testing.M — only used from generated test main */
+typedef struct hg_testing_M { int dummy; } hg_testing_M;
+int hg_testing_M_Run(hg_testing_M *m);
 
 /* fmt stubs (called from generated init functions) */
 static inline void hg_fmt_init(void) {}
@@ -266,9 +394,84 @@ void hg_fmt_print(hg_slice_hg_iface_t_t args);
 void hg_fmt_printf(hg_string_t fmt, hg_slice_hg_iface_t_t args);
 hg_string_t hg_fmt_sprintf(hg_string_t fmt, hg_slice_hg_iface_t_t args);
 
+/* interface equality — compares by value (memcmp via type size) not by pointer identity */
+static inline bool hg_iface_equal(hg_iface_t a, hg_iface_t b) {
+    if (a.itab != b.itab) return false;
+    if (a.itab == NULL) return true;
+    if (a.data == b.data) return true;
+    size_t sz = ((const hg_iface_tab_t*)a.itab)->type->size;
+    if (sz == 0) return true;
+    return memcmp(a.data, b.data, sz) == 0;
+}
+
 /* helper: print a Go string via printf */
 static inline void hg_print_string(hg_string_t s) {
     if (s.ptr && s.len > 0) {
         fwrite(s.ptr, 1, (size_t)s.len, stdout);
     }
 }
+
+/* slices.SortFunc shim for slices of pointers (element type = any pointer) */
+typedef int64_t (*_hg_ptrcmp_fn_t)(void*, void*, void*);
+static hg_func_t _hg_sortfunc_ptr_cmpfn;
+static int _hg_sortfunc_ptr_qcmp(const void* a, const void* b) {
+    void* pa = *(void* const*)a;
+    void* pb = *(void* const*)b;
+    return (int)((_hg_ptrcmp_fn_t)_hg_sortfunc_ptr_cmpfn.fn)(_hg_sortfunc_ptr_cmpfn.env, pa, pb);
+}
+static inline void hg_slices_sortfunc_ptr(void** arr, int64_t n, hg_func_t cmp) {
+    _hg_sortfunc_ptr_cmpfn = cmp;
+    qsort(arr, (size_t)n, sizeof(void*), _hg_sortfunc_ptr_qcmp);
+}
+
+/* slices.Clone shims */
+static inline hg_slice_double_t hg_slices_clone_f64(hg_slice_double_t s) {
+    if (s.len == 0) return (hg_slice_double_t){NULL, 0, 0};
+    double *p = (double*)hg_alloc((size_t)s.len * sizeof(double));
+    memcpy(p, s.ptr, (size_t)s.len * sizeof(double));
+    return (hg_slice_double_t){p, s.len, s.len};
+}
+static inline hg_slice_int64_t hg_slices_clone_i64(hg_slice_int64_t s) {
+    if (s.len == 0) return (hg_slice_int64_t){NULL, 0, 0};
+    int64_t *p = (int64_t*)hg_alloc((size_t)s.len * sizeof(int64_t));
+    memcpy(p, s.ptr, (size_t)s.len * sizeof(int64_t));
+    return (hg_slice_int64_t){p, s.len, s.len};
+}
+static inline hg_slice_hg_string_t_t hg_slices_clone_str(hg_slice_hg_string_t_t s) {
+    if (s.len == 0) return (hg_slice_hg_string_t_t){NULL, 0, 0};
+    hg_string_t *p = (hg_string_t*)hg_alloc((size_t)s.len * sizeof(hg_string_t));
+    memcpy(p, s.ptr, (size_t)s.len * sizeof(hg_string_t));
+    return (hg_slice_hg_string_t_t){p, s.len, s.len};
+}
+
+/* slices.EqualFunc shim for []float64 */
+static inline bool hg_slices_equalfunc_f64(hg_slice_double_t a, hg_slice_double_t b, hg_func_t eq) {
+    if (a.len != b.len) return false;
+    for (int64_t i = 0; i < a.len; i++) {
+        bool r = ((bool(*)(void*, double, double))eq.fn)(eq.env, a.ptr[i], b.ptr[i]);
+        if (!r) return false;
+    }
+    return true;
+}
+
+/* math/rand/v2 shim — Xorshift64 for test PRNG */
+static uint64_t _hg_rand_state = 1442695040888963407ULL;
+static inline int64_t hg_rand_intn(int64_t n) {
+    if (n <= 0) return 0;
+    _hg_rand_state ^= _hg_rand_state << 13;
+    _hg_rand_state ^= _hg_rand_state >> 7;
+    _hg_rand_state ^= _hg_rand_state << 17;
+    return (int64_t)((_hg_rand_state >> 1) % (uint64_t)n);
+}
+/* rand.Rand object — holds nothing useful; all calls go to package-level shim */
+typedef struct hg_rand_Rand_t { uint64_t state; } hg_rand_Rand_t;
+static inline hg_rand_Rand_t* hg_rand_New(void) {
+    hg_rand_Rand_t *r = (hg_rand_Rand_t*)hg_alloc(sizeof(hg_rand_Rand_t));
+    r->state = _hg_rand_state;
+    return r;
+}
+static inline int64_t hg_rand_Rand_IntN(hg_rand_Rand_t *r, int64_t n) {
+    (void)r;
+    return hg_rand_intn(n);
+}
+static inline void hg_rand_init(void) {}
