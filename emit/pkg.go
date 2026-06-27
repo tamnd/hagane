@@ -15,9 +15,9 @@ import (
 type pkgEmitter struct {
 	e             *Emitter
 	pkg           *ssa.Package
-	inRecoverBlk  bool                  // true while emitting fn.Recover block
-	curFnHasFrame bool                  // true if current function has a setjmp panic frame
-	earlyAllocs   map[ssa.Value]bool    // Allocs hoisted before the setjmp frame
+	inRecoverBlk  bool               // true while emitting fn.Recover block
+	curFnHasFrame bool               // true if current function has a setjmp panic frame
+	earlyAllocs   map[ssa.Value]bool // Allocs hoisted before the setjmp frame
 }
 
 func (pe *pkgEmitter) prefix() string {
