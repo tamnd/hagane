@@ -6,13 +6,6 @@ import (
 	"strings"
 )
 
-// cType returns the C type string for the given Go type.
-// For types that require a C struct declaration (slices, arrays, structs),
-// it registers the type so pkgEmitter.emitTypeDecls can emit it.
-func (e *Emitter) cType(t types.Type) string {
-	return e.cTypeInner(t.Underlying())
-}
-
 func (e *Emitter) cTypeInner(t types.Type) string {
 	switch t := t.(type) {
 	case *types.Basic:
@@ -180,11 +173,11 @@ func retStructName(prefix, funcName string) string {
 func retStructDecl(e *Emitter, prefix, funcName string, results *types.Tuple) string {
 	typeName := retStructName(prefix, funcName)
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("typedef struct {\n"))
+	sb.WriteString("typedef struct {\n")
 	for i := 0; i < results.Len(); i++ {
 		ct := e.cTypeOf(results.At(i).Type())
-		sb.WriteString(fmt.Sprintf("    %s r%d;\n", ct, i))
+		fmt.Fprintf(&sb, "    %s r%d;\n", ct, i)
 	}
-	sb.WriteString(fmt.Sprintf("} %s;\n", typeName))
+	fmt.Fprintf(&sb, "} %s;\n", typeName)
 	return sb.String()
 }

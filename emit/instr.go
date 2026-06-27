@@ -1648,4 +1648,3 @@ func (pe *pkgEmitter) emitRangeDecls(fn *ssa.Function, b *bytes.Buffer) {
 		}
 	}
 }
-

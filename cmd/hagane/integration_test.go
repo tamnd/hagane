@@ -66,7 +66,6 @@ func TestIntegration(t *testing.T) {
 	}
 
 	for _, mainGo := range entries {
-		mainGo := mainGo
 		dir := filepath.Dir(mainGo)
 		name := filepath.Base(dir)
 
@@ -172,7 +171,7 @@ func runHagane(t *testing.T, dir string) (stdout, stderr string, code int) {
 	if err != nil {
 		t.Fatalf("MkdirTemp: %v", err)
 	}
-	defer os.RemoveAll(tmp)
+	defer os.RemoveAll(tmp) //nolint:errcheck
 
 	// Step 1: emit C files.
 	emitOut, emitErr := exec.Command(haganeBin, "emit", "--out-dir", tmp, dir).CombinedOutput()

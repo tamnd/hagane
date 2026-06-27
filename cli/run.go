@@ -21,7 +21,7 @@ func newRunCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			defer os.RemoveAll(tmp)
+			defer os.RemoveAll(tmp) //nolint:errcheck
 
 			prog, err := frontend.Load(loadConfig(args))
 			if err != nil {

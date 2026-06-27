@@ -13,7 +13,7 @@ import (
 // Config holds options for loading Go source.
 type Config struct {
 	Patterns   []string
-	Dir        string   // working directory for package loading (default: "")
+	Dir        string // working directory for package loading (default: "")
 	BuildFlags []string
 	Tests      bool
 	GOOS       string
