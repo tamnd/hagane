@@ -1,0 +1,9 @@
+/bin/
+/dist/
+*.out
+.DS_Store
+/docs/public*/
+**/.tago-cache.db
+/testdata/*/out/
+/testdata/*/_c/
+/testdata/*/bin

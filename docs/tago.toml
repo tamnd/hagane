@@ -1,0 +1,7 @@
+title       = "hagane"
+baseURL     = "https://hagane.tamnd.com/"
+theme       = "tago-doks"
+description = "hagane (鋼, steel) compiles Go to C. Write normal Go source, get readable C11 out, build with GCC or Clang. Zero CGO overhead, no LLVM, no intermediate IR."
+
+[params]
+  github = "https://github.com/tamnd/hagane"

@@ -1,0 +1,167 @@
+# GoReleaser turns one tag push into everything a user might install from: raw
+# archives, Linux packages (deb, rpm, apk), and entries for the package
+# managers (Homebrew, Scoop). `git tag vX.Y.Z && git push --tags` fans out to
+# all of them through .github/workflows/release.yml.
+#
+# Publish steps that push to a repository we do not own yet (the Homebrew tap,
+# the Scoop bucket) self-disable when their token is absent. A release with no
+# extra secrets still produces every downloadable artifact; each manager lights
+# up the moment its repository and token exist.
+version: 2
+
+project_name: hagane
+
+before:
+  hooks:
+    - go mod download
+
+builds:
+  - id: hagane
+    binary: hagane
+    main: ./cmd/hagane
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/tamnd/hagane/cli.Version={{ .Version }}
+      - -X github.com/tamnd/hagane/cli.Commit={{ .ShortCommit }}
+      - -X github.com/tamnd/hagane/cli.Date={{ .CommitDate }}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+    targets:
+      - linux_amd64
+      - linux_arm64
+      - linux_arm_7
+      - linux_386
+      - darwin_amd64
+      - darwin_arm64
+      - windows_amd64
+      - windows_arm64
+      - freebsd_amd64
+      - freebsd_arm64
+
+archives:
+  - id: default
+    ids:
+      - hagane
+    name_template: "hagane_{{ .Version }}_{{ .Os }}_{{ .Arch }}{{ with .Arm }}v{{ . }}{{ end }}"
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files:
+      - LICENSE
+      - README.md
+
+nfpms:
+  - id: linux-packages
+    package_name: hagane
+    ids:
+      - hagane
+    file_name_template: "{{ .ConventionalFileName }}"
+    vendor: tamnd
+    homepage: https://github.com/tamnd/hagane
+    maintainer: Duc-Tam Nguyen <tamnd87@gmail.com>
+    description: Go-to-C transpiler; write Go, emit readable C, compile with GCC/Clang.
+    license: MIT
+    formats:
+      - deb
+      - rpm
+      - apk
+    bindir: /usr/bin
+    section: utils
+    contents:
+      - src: ./LICENSE
+        dst: /usr/share/doc/hagane/LICENSE
+
+# TODO: docker section for a future milestone
+# dockers_v2:
+#   - images:
+#       - ghcr.io/tamnd/hagane
+#     ...
+
+homebrew_casks:
+  # Pushed to tamnd/homebrew-tap. Self-disables until HOMEBREW_TAP_GITHUB_TOKEN
+  # (a PAT with write to the tap) is set.
+  - name: hagane
+    ids:
+      - default
+    repository:
+      owner: tamnd
+      name: homebrew-tap
+      token: '{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}'
+    directory: Casks
+    homepage: https://github.com/tamnd/hagane
+    description: Go-to-C transpiler; write Go, emit readable C, compile with GCC/Clang.
+    skip_upload: '{{ if index .Env "HOMEBREW_TAP_GITHUB_TOKEN" }}false{{ else }}true{{ end }}'
+    commit_author:
+      name: Duc-Tam Nguyen
+      email: tamnd87@gmail.com
+
+scoops:
+  # Scoop manifest for Windows, pushed to tamnd/scoop-bucket. Self-disables
+  # until SCOOP_BUCKET_GITHUB_TOKEN is set.
+  - ids:
+      - default
+    repository:
+      owner: tamnd
+      name: scoop-bucket
+      token: '{{ .Env.SCOOP_BUCKET_GITHUB_TOKEN }}'
+    directory: bucket
+    homepage: https://github.com/tamnd/hagane
+    description: Go-to-C transpiler; write Go, emit readable C, compile with GCC/Clang.
+    license: MIT
+    skip_upload: '{{ if index .Env "SCOOP_BUCKET_GITHUB_TOKEN" }}false{{ else }}true{{ end }}'
+    commit_author:
+      name: Duc-Tam Nguyen
+      email: tamnd87@gmail.com
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+sboms:
+  - id: archive
+    artifacts: archive
+
+signs:
+  # Keyless cosign signature over the checksum file. Runs only on a real
+  # release in CI where the workflow grants the OIDC token cosign needs.
+  - cmd: cosign
+    certificate: "${artifact}.pem"
+    args:
+      - sign-blob
+      - "--output-certificate=${certificate}"
+      - "--output-signature=${signature}"
+      - "${artifact}"
+      - "--yes"
+    artifacts: checksum
+    output: true
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+      - Merge pull request
+      - Merge branch
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\(.+\))??!?:.+$'
+      order: 0
+    - title: Fixes
+      regexp: '^.*?fix(\(.+\))??!?:.+$'
+      order: 1
+    - title: Other
+      order: 999
+
+release:
+  github:
+    owner: tamnd
+    name: hagane
+  draft: false
+  prerelease: auto
