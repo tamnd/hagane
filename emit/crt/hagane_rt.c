@@ -314,6 +314,43 @@ static void hg_iface_fprint(FILE *f, hg_iface_t v) {
 
 static void hg_iface_print(hg_iface_t v) { hg_iface_fprint(stdout, v); }
 
+/* ── panic/recover state ─────────────────────────────────────────────────── */
+
+hg_panic_frame_t *hg_panic_top    = NULL;
+bool              hg_panic_active  = false;
+hg_iface_t        hg_panic_value   = {NULL, NULL};
+
+void hg_throw(hg_iface_t val) {
+    hg_panic_active = true;
+    hg_panic_value  = val;
+    if (hg_panic_top) {
+        longjmp(hg_panic_top->buf, 1);
+    }
+    fprintf(stderr, "goroutine 1 [running]:\npanic: ");
+    hg_iface_fprint(stderr, val);
+    fprintf(stderr, "\n\ngoroutine 1 [running]:\nmain.main()\n");
+    abort();
+}
+
+hg_iface_t hg_recover(void) {
+    if (!hg_panic_active) return HG_ZERO_IFACE;
+    hg_iface_t v   = hg_panic_value;
+    hg_panic_active = false;
+    hg_panic_value  = HG_ZERO_IFACE;
+    return v;
+}
+
+void hg_repanic(void) {
+    if (!hg_panic_active) return;
+    if (hg_panic_top) {
+        longjmp(hg_panic_top->buf, 1);
+    }
+    fprintf(stderr, "goroutine 1 [running]:\npanic: ");
+    hg_iface_fprint(stderr, hg_panic_value);
+    fprintf(stderr, "\n\ngoroutine 1 [running]:\nmain.main()\n");
+    abort();
+}
+
 void hg_fmt_println(hg_slice_hg_iface_t_t args) {
     for (int64_t i = 0; i < args.len; i++) {
         if (i > 0) putchar(' ');

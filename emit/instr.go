@@ -44,6 +44,9 @@ func (pe *pkgEmitter) emitInstr(fn *ssa.Function, blk *ssa.BasicBlock, instr ssa
 		// nothing to emit here
 
 	case *ssa.Alloc:
+		if pe.earlyAllocs[v] {
+			break // already emitted before setjmp; skip
+		}
 		pe.emitAlloc(v, b)
 
 	case *ssa.Store:
@@ -152,8 +155,7 @@ func (pe *pkgEmitter) emitInstr(fn *ssa.Function, blk *ssa.BasicBlock, instr ssa
 		fmt.Fprintf(b, "    %s %s = %s.r%d;\n", ct, valueName(v), parent, v.Index)
 
 	case *ssa.Panic:
-		pos := pe.posStr(v.Pos())
-		fmt.Fprintf(b, "    hg_panic(\"explicit panic\", \"%s\", 0);\n", pos)
+		fmt.Fprintf(b, "    hg_throw(%s);\n", pe.emitValue(v.X))
 
 	case *ssa.RunDefers:
 		fmt.Fprintf(b, "    hg_run_defers(_hg_defer_head);\n")
@@ -792,13 +794,28 @@ func (pe *pkgEmitter) emitBuiltin(name string, args []ssa.Value, v *ssa.Call, b 
 		fmt.Fprintf(b, "    /* close: M0 stub */\n")
 
 	case "panic":
-		pos := pe.posStr(v.Pos())
-		fmt.Fprintf(b, "    hg_panic(\"explicit panic\", \"%s\", 0);\n", pos)
+		// builtin panic(x): box x as interface{} then throw
+		if len(args) == 1 {
+			arg := args[0]
+			xName := pe.emitValue(arg)
+			if _, isIface := arg.Type().Underlying().(*types.Interface); isIface {
+				fmt.Fprintf(b, "    hg_throw(%s);\n", xName)
+			} else {
+				xt := pe.e.cTypeOf(arg.Type())
+				itab := pe.e.ifaceItabExpr(arg.Type(), types.NewInterfaceType(nil, nil))
+				if _, isPtr := arg.Type().Underlying().(*types.Pointer); isPtr {
+					fmt.Fprintf(b, "    { hg_iface_t _pv; _pv.data=(void*)(%s); _pv.itab=(const void*)%s; hg_throw(_pv); }\n", xName, itab)
+				} else {
+					fmt.Fprintf(b, "    { %s *_pb=(%s*)hg_alloc(sizeof(%s)); *_pb=%s; hg_iface_t _pv; _pv.data=_pb; _pv.itab=(const void*)%s; hg_throw(_pv); }\n", xt, xt, xt, xName, itab)
+				}
+			}
+		}
 
 	case "recover":
 		if hasResult {
-			fmt.Fprintf(b, "    %s %s; memset(&%s, 0, sizeof(%s)); /* recover M0 stub */\n",
-				ct, valueName(v), valueName(v), valueName(v))
+			fmt.Fprintf(b, "    %s %s = hg_recover();\n", ct, valueName(v))
+		} else {
+			fmt.Fprintf(b, "    hg_recover();\n")
 		}
 
 	case "print":
@@ -919,6 +936,10 @@ func fmtVerb(pe *pkgEmitter, v ssa.Value) (string, string, string) {
 }
 
 func (pe *pkgEmitter) emitReturn(fn *ssa.Function, v *ssa.Return, b *bytes.Buffer) {
+	// pop panic frame on normal exit (recover block already popped it in setjmp handler)
+	if pe.curFnHasFrame && !pe.inRecoverBlk {
+		fmt.Fprintf(b, "    hg_panic_frame_pop(&_hg_frame);\n")
+	}
 	results := fn.Signature.Results()
 	switch results.Len() {
 	case 0:

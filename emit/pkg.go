@@ -13,8 +13,11 @@ import (
 
 // pkgEmitter emits one package into e.hdrbuf (declarations) and e.buf (bodies).
 type pkgEmitter struct {
-	e   *Emitter
-	pkg *ssa.Package
+	e             *Emitter
+	pkg           *ssa.Package
+	inRecoverBlk  bool                  // true while emitting fn.Recover block
+	curFnHasFrame bool                  // true if current function has a setjmp panic frame
+	earlyAllocs   map[ssa.Value]bool    // Allocs hoisted before the setjmp frame
 }
 
 func (pe *pkgEmitter) prefix() string {
@@ -197,9 +200,46 @@ func (pe *pkgEmitter) emitFunc(fn *ssa.Function) {
 		fmt.Fprintf(b, "    %s *_env = (%s*)_hg_env;\n", envTypeName, envTypeName)
 	}
 
-	// defer linked-list head if function has any Defer instructions
-	if pe.fnHasDefers(fn) {
-		fmt.Fprintf(b, "    hg_defer_t *_hg_defer_head = NULL;\n")
+	// defer linked-list head + optional setjmp panic frame
+	hasDefers := pe.fnHasDefers(fn)
+	pe.curFnHasFrame = hasDefers && fn.Recover != nil
+	pe.earlyAllocs = nil
+	if hasDefers {
+		if pe.curFnHasFrame {
+			// volatile so -O2 doesn't cache it in a register across the setjmp
+			fmt.Fprintf(b, "    hg_defer_t * volatile _hg_defer_head = NULL;\n")
+		} else {
+			fmt.Fprintf(b, "    hg_defer_t *_hg_defer_head = NULL;\n")
+		}
+	}
+	if pe.curFnHasFrame {
+		// Named return variables are loaded in the recover block.  Their Allocs live
+		// in blk0.  If panic fires before blk0 runs them, the recover block would
+		// dereference uninitialised pointers.  Emit those Allocs now — before the
+		// setjmp — so they are always valid when the recover block runs.
+		pe.earlyAllocs = map[ssa.Value]bool{}
+		for _, instr := range fn.Recover.Instrs {
+			unop, ok := instr.(*ssa.UnOp)
+			if !ok {
+				continue
+			}
+			alloc, ok := unop.X.(*ssa.Alloc)
+			if !ok {
+				continue
+			}
+			if pe.earlyAllocs[alloc] {
+				continue
+			}
+			pe.earlyAllocs[alloc] = true
+			pe.emitAlloc(alloc, b)
+		}
+
+		fmt.Fprintf(b, "    hg_panic_frame_t _hg_frame;\n")
+		fmt.Fprintf(b, "    hg_panic_frame_push(&_hg_frame);\n")
+		// On panic: pop frame, run defers (one may call recover()), repanic if not
+		// recovered, then fall through to the recover block.
+		fmt.Fprintf(b, "    if (setjmp(_hg_frame.buf) != 0) { hg_panic_frame_pop(&_hg_frame); hg_run_defers((hg_defer_t*)_hg_defer_head); hg_repanic(); goto blk%d; }\n",
+			fn.Recover.Index)
 	}
 
 	pe.emitLocalDecls(fn, b)
@@ -263,11 +303,11 @@ func (pe *pkgEmitter) emitNeededSliceTypes(fn *ssa.Function) {
 }
 
 func (pe *pkgEmitter) emitBlock(fn *ssa.Function, blk *ssa.BasicBlock, b *bytes.Buffer) {
-	// collect phi assignments to emit on predecessor edges
-	// (we emit them inline before the branch; handled in emitInstr for If/Jump)
+	pe.inRecoverBlk = fn.Recover != nil && blk == fn.Recover
 	for i, instr := range blk.Instrs {
 		pe.emitInstr(fn, blk, instr, i == len(blk.Instrs)-1, b)
 	}
+	pe.inRecoverBlk = false
 }
 
 func (pe *pkgEmitter) fnHasDefers(fn *ssa.Function) bool {
