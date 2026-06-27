@@ -194,6 +194,9 @@ func runHagane(t *testing.T, dir string) (stdout, stderr string, code int) {
 		binary += ".exe"
 	}
 	gccArgs := append([]string{"-O1", "-std=c11", "-o", binary}, cFiles...)
+	if runtime.GOOS == "linux" {
+		gccArgs = append(gccArgs, "-lm")
+	}
 	gccOut, err := exec.Command(cc, gccArgs...).CombinedOutput()
 	if err != nil {
 		t.Fatalf("%s compile failed:\n%s", cc, gccOut)
