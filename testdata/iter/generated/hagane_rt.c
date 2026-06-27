@@ -305,6 +305,11 @@ static void hg_iface_fprint(FILE *f, hg_iface_t v) {
         return;
     }
     default: {
+        if (tab->stringer) {
+            hg_string_t s = tab->stringer(v.data);
+            fprintf(f, "%.*s", (int)s.len, s.ptr ? s.ptr : "");
+            return;
+        }
         const char *nm = (tab->type && tab->type->name) ? tab->type->name : "?";
         fprintf(f, "<%s Value>", nm);
         return;
@@ -313,6 +318,43 @@ static void hg_iface_fprint(FILE *f, hg_iface_t v) {
 }
 
 static void hg_iface_print(hg_iface_t v) { hg_iface_fprint(stdout, v); }
+
+/* ── panic/recover state ─────────────────────────────────────────────────── */
+
+hg_panic_frame_t *hg_panic_top    = NULL;
+bool              hg_panic_active  = false;
+hg_iface_t        hg_panic_value   = {NULL, NULL};
+
+void hg_throw(hg_iface_t val) {
+    hg_panic_active = true;
+    hg_panic_value  = val;
+    if (hg_panic_top) {
+        longjmp(hg_panic_top->buf, 1);
+    }
+    fprintf(stderr, "goroutine 1 [running]:\npanic: ");
+    hg_iface_fprint(stderr, val);
+    fprintf(stderr, "\n\ngoroutine 1 [running]:\nmain.main()\n");
+    abort();
+}
+
+hg_iface_t hg_recover(void) {
+    if (!hg_panic_active) return HG_ZERO_IFACE;
+    hg_iface_t v   = hg_panic_value;
+    hg_panic_active = false;
+    hg_panic_value  = HG_ZERO_IFACE;
+    return v;
+}
+
+void hg_repanic(void) {
+    if (!hg_panic_active) return;
+    if (hg_panic_top) {
+        longjmp(hg_panic_top->buf, 1);
+    }
+    fprintf(stderr, "goroutine 1 [running]:\npanic: ");
+    hg_iface_fprint(stderr, hg_panic_value);
+    fprintf(stderr, "\n\ngoroutine 1 [running]:\nmain.main()\n");
+    abort();
+}
 
 void hg_fmt_println(hg_slice_hg_iface_t_t args) {
     for (int64_t i = 0; i < args.len; i++) {
@@ -532,6 +574,11 @@ static void hg_iface_sbuf(hg_sbuf_t *b, hg_iface_t v) {
         return;
     }
     default: {
+        if (tab->stringer) {
+            hg_string_t s = tab->stringer(v.data);
+            hg_sbuf_writes(b, s.ptr ? s.ptr : "", s.ptr ? (size_t)s.len : 0);
+            return;
+        }
         const char *name = (tab->type && tab->type->name) ? tab->type->name : "?";
         hg_sbuf_writes(b, "<", 1);
         hg_sbuf_writes(b, name, strlen(name));
@@ -609,4 +656,28 @@ hg_string_t hg_fmt_sprintf(hg_string_t fmt_str, hg_slice_hg_iface_t_t args) {
     hg_sbuf_grow(&b, 1);
     b.data[b.len] = '\0';
     return (hg_string_t){.ptr = b.data, .len = (int64_t)b.len};
+}
+
+/* ── errors shim ─────────────────────────────────────────────────────────── */
+
+typedef struct { hg_string_t msg; } hg_errors_errorString_t;
+
+static hg_string_t hg_errors_errorString_Error(void *self) {
+    return ((hg_errors_errorString_t*)self)->msg;
+}
+
+static const hg_type_t hg_type_errors_errorString = {
+    sizeof(hg_errors_errorString_t), HG_KIND_STRUCT, "*errors.errorString", NULL
+};
+static void *hg_errors_errorString_methods[] = { (void*)hg_errors_errorString_Error };
+static const hg_iface_tab_t hg_itab_errors_errorString = {
+    &hg_type_errors_errorString,
+    hg_errors_errorString_methods,
+    hg_errors_errorString_Error,
+};
+
+hg_iface_t hg_errors_New(hg_string_t msg) {
+    hg_errors_errorString_t *s = (hg_errors_errorString_t*)hg_alloc(sizeof(hg_errors_errorString_t));
+    s->msg = msg;
+    return (hg_iface_t){.itab = (const void*)&hg_itab_errors_errorString, .data = s};
 }

@@ -61,22 +61,34 @@ func Load(cfg *Config) (*Program, error) {
 
 	// Build SSA. SanityCheckFunctions validates the SSA invariants.
 	mode := ssa.SanityCheckFunctions | ssa.InstantiateGenerics
-	prog, ssaPkgs := ssautil.AllPackages(pkgs, mode)
+	prog, _ := ssautil.AllPackages(pkgs, mode)
 	prog.Build()
 
+	// Collect ALL packages (root + transitive imports) in post-order so
+	// dependencies always appear before the packages that import them.
+	var all []*ssa.Package
+	seen := make(map[string]bool)
+	packages.Visit(pkgs, func(p *packages.Package) bool {
+		return true
+	}, func(p *packages.Package) {
+		if p.Types == nil {
+			return
+		}
+		path := p.Types.Path()
+		if seen[path] {
+			return
+		}
+		seen[path] = true
+		if sp := prog.Package(p.Types); sp != nil {
+			all = append(all, sp)
+		}
+	})
+
 	var mainPkg *ssa.Package
-	for _, p := range ssaPkgs {
+	for _, p := range all {
 		if p != nil && p.Pkg.Name() == "main" {
 			mainPkg = p
 			break
-		}
-	}
-
-	// filter out nil packages (external test packages etc.)
-	var all []*ssa.Package
-	for _, p := range ssaPkgs {
-		if p != nil {
-			all = append(all, p)
 		}
 	}
 
