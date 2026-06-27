@@ -26,8 +26,8 @@ type Emitter struct {
 	hdrbuf     *bytes.Buffer // header (forward decls)
 	sliceTypes map[string]bool
 	mapTypes   map[string]bool
-	nextTypes  map[string]bool // Next result tuple typedefs already emitted
-	mapFuncs   map[string]bool // hash/eq helper function names already emitted
+	nextTypes  map[string]bool      // Next result tuple typedefs already emitted
+	mapFuncs   map[string]bool      // hash/eq helper function names already emitted
 	ifacePairs map[string]ifacePair // (concrete, iface) pairs for M3 itab emission
 }
 
@@ -116,9 +116,9 @@ func (e *Emitter) emitPkg(pkg *ssa.Package) ([]byte, error) {
 		st[k] = v
 	}
 	e.sliceTypes = st
-	e.mapTypes   = make(map[string]bool)
-	e.nextTypes  = make(map[string]bool)
-	e.mapFuncs   = make(map[string]bool)
+	e.mapTypes = make(map[string]bool)
+	e.nextTypes = make(map[string]bool)
+	e.mapFuncs = make(map[string]bool)
 	e.ifacePairs = make(map[string]ifacePair)
 
 	// collect all functions in this package (including methods) via AllFunctions

@@ -40,7 +40,7 @@ func newBuildCmd() *cobra.Command {
 				if err != nil {
 					return fmt.Errorf("tmpdir: %w", err)
 				}
-				defer os.RemoveAll(tmp)
+				defer os.RemoveAll(tmp) //nolint:errcheck
 				dir = tmp
 			}
 

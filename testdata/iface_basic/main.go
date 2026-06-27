@@ -9,8 +9,8 @@ type Greeter interface {
 type English struct{ name string }
 type Spanish struct{ name string }
 
-func (e English) Greet() string  { return "Hello, " + e.name }
-func (s Spanish) Greet() string  { return "Hola, " + s.name }
+func (e English) Greet() string { return "Hello, " + e.name }
+func (s Spanish) Greet() string { return "Hola, " + s.name }
 
 func greet(g Greeter) {
 	fmt.Println(g.Greet())

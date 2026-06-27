@@ -318,5 +318,7 @@ func (pe *pkgEmitter) posStr(pos token.Pos) string {
 		return "?"
 	}
 	p := pe.e.fset.Position(pos)
-	return fmt.Sprintf("%s:%d", p.Filename, p.Line)
+	// Escape backslashes so the path is valid in a C string literal (Windows paths).
+	filename := strings.ReplaceAll(p.Filename, `\`, `\\`)
+	return fmt.Sprintf("%s:%d", filename, p.Line)
 }

@@ -599,34 +599,38 @@ func (pe *pkgEmitter) emitTypeAssert(v *ssa.TypeAssert, b *bytes.Buffer) {
 	// For primitive types, we also go through hg_iface_tab_t* (since we switched from HG_TYPE_XXX)
 	concreteCheck := fmt.Sprintf("((const hg_iface_tab_t*)%s.itab)->type == %s", ifaceVal, typeExpr)
 
+	// Determine the human-readable name of the asserted type for panic messages.
+	typeName := ""
+	if named, ok := assertedType.(*types.Named); ok {
+		typeName = named.Obj().Pkg().Path() + "." + named.Obj().Name()
+	} else {
+		typeName = assertedType.String()
+	}
+
 	if v.CommaOk {
-		// Result is a tuple (T, bool)
+		// Result is a tuple (T, bool); nil interface → (zero, false) without crash.
 		tupleName := pe.e.typeAssertTupleName(assertedType)
 		pe.e.emitTypeAssertTuple(assertedType, tupleName)
 		ct := pe.e.cTypeOf(assertedType)
 		fmt.Fprintf(b, "    %s %s; {\n", tupleName, valueName(v))
-		fmt.Fprintf(b, "        %s.r1 = (%s);\n", valueName(v), concreteCheck)
+		fmt.Fprintf(b, "        %s.r1 = ((%s).itab && %s);\n", valueName(v), ifaceVal, concreteCheck)
 		if ct != "" && ct != "void" {
-			fmt.Fprintf(b, "        if (%s.r1) %s.r0 = *(%s*)%s.data; else memset(&%s.r0, 0, sizeof(%s.r0));\n",
+			fmt.Fprintf(b, "        if (%s.r1) %s.r0 = *(%s*)(%s).data; else memset(&%s.r0, 0, sizeof(%s.r0));\n",
 				valueName(v), valueName(v), ct, ifaceVal, valueName(v), valueName(v))
 		}
 		fmt.Fprintf(b, "    }\n")
 	} else {
-		// Panicking assertion
+		// Panicking assertion: nil interface → "interface conversion: interface is nil, not T"
 		ct := pe.e.cTypeOf(assertedType)
 		if typeExpr != "" && typeExpr != "NULL" {
-			typeName := ""
-			if named, ok := assertedType.(*types.Named); ok {
-				typeName = named.Obj().Pkg().Path() + "." + named.Obj().Name()
-			} else {
-				typeName = assertedType.String()
-			}
-			haveExpr := fmt.Sprintf("((const hg_iface_tab_t*)%s.itab)->type->name", ifaceVal)
+			fmt.Fprintf(b, "    if (!(%s).itab) hg_panic_typeassert(\"<nil>\", \"%s\");\n",
+				ifaceVal, typeName)
+			haveExpr := fmt.Sprintf("((const hg_iface_tab_t*)(%s).itab)->type->name", ifaceVal)
 			fmt.Fprintf(b, "    if (!(%s)) hg_panic_typeassert(%s, \"%s\");\n",
 				concreteCheck, haveExpr, typeName)
 		}
 		if ct != "" && ct != "void" {
-			fmt.Fprintf(b, "    %s %s = *(%s*)%s.data;\n", ct, valueName(v), ct, ifaceVal)
+			fmt.Fprintf(b, "    %s %s = *(%s*)(%s).data;\n", ct, valueName(v), ct, ifaceVal)
 		} else {
 			fmt.Fprintf(b, "    /* TypeAssert to void/unknown */\n")
 		}
@@ -1648,4 +1652,3 @@ func (pe *pkgEmitter) emitRangeDecls(fn *ssa.Function, b *bytes.Buffer) {
 		}
 	}
 }
-
