@@ -19,7 +19,12 @@ func (e *Emitter) cTypeInner(t types.Type) string {
 	case *types.Slice:
 		elem := e.cTypeInner(t.Elem().Underlying())
 		name := sliceTypeName(elem)
-		e.sliceTypes[name] = true
+		if !e.sliceTypes[name] {
+			e.sliceTypes[name] = true
+			if e.hdrbuf != nil {
+				fmt.Fprint(e.hdrbuf, sliceTypeDecl(elem))
+			}
+		}
 		return name
 
 	case *types.Array:
@@ -34,8 +39,7 @@ func (e *Emitter) cTypeInner(t types.Type) string {
 		return name
 
 	case *types.Struct:
-		// unnamed struct; use field-based name (rare in Go SSA at top level)
-		return "hg_anon_struct_t"
+		return e.anonStructCType(t)
 
 	case *types.Interface:
 		return "hg_iface_t"
@@ -67,6 +71,24 @@ func (e *Emitter) cTypeNamed(t *types.Named) string {
 			return "hg_iface_t"
 		}
 		return "hg_builtin_" + t.Obj().Name() + "_t"
+	}
+	// testing.T and testing.common both map to the same C shim struct.
+	if pkg.Path() == "testing" {
+		switch t.Obj().Name() {
+		case "T", "common", "B", "F":
+			return "hg_testing_T"
+		case "M":
+			return "hg_testing_M"
+		}
+	}
+	// For named types from non-transpiled packages, use the appropriate placeholder:
+	// - Interface types → hg_iface_t (all interfaces are the same two-word struct)
+	// - Everything else → hg_anon_struct_t (opaque but complete placeholder struct)
+	if !e.isTranspiled(pkg.Path()) {
+		if _, isIface := t.Underlying().(*types.Interface); isIface {
+			return "hg_iface_t"
+		}
+		return "hg_anon_struct_t"
 	}
 	prefix := pkgCPrefix(pkg.Path())
 	return prefix + t.Obj().Name() + "_t"
@@ -138,16 +160,115 @@ func sliceTypeName(elemCType string) string {
 	return "hg_slice_" + mangle(elemCType) + "_t"
 }
 
+// anonStructCType returns (and if necessary emits) a C typedef for an anonymous
+// Go struct type. Two anonymous structs with the same layout map to the same name.
+//
+// Fields are emitted using cTypeInner(field.Type().Underlying()) rather than
+// cTypeOf(field.Type()), so that named-type aliases (like earthMass float64)
+// from packages not yet defined in the header resolve to their primitive
+// equivalents (double) without creating forward-reference problems.
+func (e *Emitter) anonStructCType(t *types.Struct) string {
+	key := t.String()
+	if name, ok := e.anonStructNames[key]; ok {
+		return name
+	}
+	// Generate a stable name from the field names.
+	var parts []string
+	for i := 0; i < t.NumFields(); i++ {
+		parts = append(parts, sanitizeName(t.Field(i).Name()))
+	}
+	base := strings.Join(parts, "_")
+	if base == "" {
+		base = "empty"
+	}
+	name := "hg_anon_" + base + "_t"
+	if e.anonStructNames == nil {
+		e.anonStructNames = make(map[string]string)
+	}
+	// If the base name is already used by a different struct layout, add a counter.
+	// We detect collisions by checking whether any existing entry maps to the same C name.
+	for _, usedName := range e.anonStructNames {
+		if usedName == name {
+			name = fmt.Sprintf("hg_anon_%d_%s_t", len(e.anonStructNames)+1, base)
+			break
+		}
+	}
+	e.anonStructNames[key] = name
+	if e.hdrbuf != nil {
+		// Forward declaration first (so the name is visible for pointer fields in later types).
+		fmt.Fprintf(e.hdrbuf, "typedef struct %s %s;\n", name, name)
+		// Compute field C types first (may write slice typedefs to hdrbuf as side effects).
+		// Use cTypeInner(f.Type().Underlying()) to avoid referencing named-type aliases that
+		// may not yet be defined (anonymous structs are often emitted during globals processing,
+		// before the named-type-alias pass in emitHeader).
+		type fieldInfo struct{ ct, nm string }
+		fields := make([]fieldInfo, t.NumFields())
+		for i := 0; i < t.NumFields(); i++ {
+			f := t.Field(i)
+			// Use Underlying() to collapse named aliases to their primitive C types.
+			// cTypeInner handles Pointer, Slice, Struct, Basic — all safe here.
+			ft := e.cTypeInner(f.Type().Underlying())
+			fields[i] = fieldInfo{ft, f.Name()}
+		}
+		// Now emit the struct body (all side effects on hdrbuf already happened above).
+		fmt.Fprintf(e.hdrbuf, "struct %s {\n", name)
+		for _, fi := range fields {
+			fmt.Fprintf(e.hdrbuf, "    %s %s;\n", fi.ct, fi.nm)
+		}
+		fmt.Fprintf(e.hdrbuf, "};\n")
+	}
+	return name
+}
+
 // sliceTypeDecl emits "typedef struct { T *ptr; int64_t len; int64_t cap; } hg_slice_T_t;"
 func sliceTypeDecl(elemCType string) string {
 	name := sliceTypeName(elemCType)
-	return fmt.Sprintf("typedef struct { %s *ptr; int64_t len; int64_t cap; } %s;\n", elemCType, name)
+	g := "HG_TYPEDEF_" + strings.ToUpper(mangle(name))
+	return fmt.Sprintf("#ifndef %s\n#define %s\ntypedef struct { %s *ptr; int64_t len; int64_t cap; } %s;\n#endif\n", g, g, elemCType, name)
 }
 
 // arrayTypeDecl emits the C struct for a Go array type.
 func arrayTypeDecl(elemCType string, n int64) string {
 	name := fmt.Sprintf("hg_array_%s_%d_t", mangle(elemCType), n)
-	return fmt.Sprintf("typedef struct { %s elems[%d]; } %s;\n", elemCType, n, name)
+	g := "HG_TYPEDEF_" + strings.ToUpper(mangle(name))
+	return fmt.Sprintf("#ifndef %s\n#define %s\ntypedef struct { %s elems[%d]; } %s;\n#endif\n", g, g, elemCType, n, name)
+}
+
+// safeSkipCType returns a safe C type for the return value of a skipped call.
+// Named types from non-transpiled packages become void* to avoid undefined references.
+func (e *Emitter) safeSkipCType(t types.Type) string {
+	switch t := t.(type) {
+	case *types.Named:
+		pkg := t.Obj().Pkg()
+		if pkg != nil {
+			if !e.isTranspiled(pkg.Path()) {
+				return "void*"
+			}
+		}
+	case *types.Pointer:
+		inner := e.safeSkipCType(t.Elem())
+		return inner + "*"
+	}
+	return e.cTypeOf(t)
+}
+
+// isTranspiled returns true if the given package path is being emitted as C.
+// When e.transpiled is non-empty (populated by EmitAll or EmitAllTest), we
+// check the map. When it's empty (e.g. EmitPkg called in isolation), we fall
+// back to path analysis so that user packages and stdlib allowlist still work.
+func (e *Emitter) isTranspiled(path string) bool {
+	if len(e.transpiled) > 0 {
+		return e.transpiled[path]
+	}
+	// No transpiled set: use static allowlist + user package detection.
+	first := path
+	if i := strings.IndexByte(first, '/'); i >= 0 {
+		first = first[:i]
+	}
+	if strings.ContainsRune(first, '.') {
+		return true // user package
+	}
+	return transpilableStdlib[path]
 }
 
 // mangle turns a C type string into a safe identifier fragment.

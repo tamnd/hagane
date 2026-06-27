@@ -252,6 +252,7 @@ const hg_iface_tab_t hg_itab_uintptr = {&hg_type_uintptr, NULL};
 static void hg_iface_fprint(FILE *f, hg_iface_t v) {
     if (!v.itab) { fprintf(f, "<nil>"); return; }
     const hg_iface_tab_t *tab = (const hg_iface_tab_t*)v.itab;
+    if (!tab->type) { fprintf(f, "(?)"); return; }
     switch (tab->type->kind) {
     case HG_KIND_BOOL:    fprintf(f, "%s", *(bool*)v.data ? "true" : "false"); return;
     case HG_KIND_INT8:    fprintf(f, "%d", (int)*(int8_t*)v.data); return;
@@ -519,6 +520,7 @@ static void hg_sbuf_printf(hg_sbuf_t *b, const char *fmt, ...) {
 static void hg_iface_sbuf(hg_sbuf_t *b, hg_iface_t v) {
     if (!v.itab) { hg_sbuf_writes(b, "<nil>", 5); return; }
     const hg_iface_tab_t *tab = (const hg_iface_tab_t*)v.itab;
+    if (!tab->type) { hg_sbuf_writes(b, "(?)", 3); return; }
     switch (tab->type->kind) {
     case HG_KIND_BOOL:   hg_sbuf_writes(b, *(bool*)v.data ? "true" : "false",
                                         *(bool*)v.data ? 4 : 5); return;
@@ -681,3 +683,102 @@ hg_iface_t hg_errors_New(hg_string_t msg) {
     s->msg = msg;
     return (hg_iface_t){.itab = (const void*)&hg_itab_errors_errorString, .data = s};
 }
+
+/* ── testing shim ────────────────────────────────────────────────────────── */
+
+static void hg_testing_print_name(hg_testing_T *t) {
+    if (t->parent) { hg_testing_print_name(t->parent); fprintf(stderr, "/"); }
+    fwrite(t->name.ptr, 1, (size_t)t->name.len, stderr);
+}
+
+static void hg_testing_mark_failed(hg_testing_T *t) {
+    t->failed = true;
+    if (t->parent) hg_testing_mark_failed(t->parent);
+}
+
+void hg_testing_Errorf(hg_testing_T *t, hg_string_t fmt, hg_slice_hg_iface_t_t args) {
+    hg_testing_mark_failed(t);
+    fprintf(stderr, "    ");
+    hg_testing_print_name(t);
+    fprintf(stderr, ": ");
+    hg_string_t msg = hg_fmt_sprintf(fmt, args);
+    fwrite(msg.ptr, 1, (size_t)msg.len, stderr);
+    fprintf(stderr, "\n");
+}
+
+void hg_testing_Error(hg_testing_T *t, hg_slice_hg_iface_t_t args) {
+    hg_testing_mark_failed(t);
+    fprintf(stderr, "    ");
+    hg_testing_print_name(t);
+    fprintf(stderr, ": ");
+    hg_fmt_println(args);
+}
+
+void hg_testing_Logf(hg_testing_T *t, hg_string_t fmt, hg_slice_hg_iface_t_t args) {
+    (void)t;
+    hg_string_t msg = hg_fmt_sprintf(fmt, args);
+    fprintf(stderr, "    ");
+    fwrite(msg.ptr, 1, (size_t)msg.len, stderr);
+    fprintf(stderr, "\n");
+}
+
+void hg_testing_Log(hg_testing_T *t, hg_slice_hg_iface_t_t args) {
+    (void)t;
+    fprintf(stderr, "    ");
+    hg_fmt_println(args);
+}
+
+void hg_testing_Fail(hg_testing_T *t) {
+    hg_testing_mark_failed(t);
+}
+
+void hg_testing_FailNow(hg_testing_T *t) {
+    hg_testing_mark_failed(t);
+    if (t->has_failnow) longjmp(t->failnow_jmp, 1);
+    /* fallback: print and abort the test */
+    fprintf(stderr, "FAIL\t");
+    hg_testing_print_name(t);
+    fprintf(stderr, "\n");
+}
+
+bool hg_testing_Failed(hg_testing_T *t) {
+    return t->failed;
+}
+
+void hg_testing_Fatal(hg_testing_T *t, hg_slice_hg_iface_t_t args) {
+    hg_testing_Error(t, args);
+    hg_testing_FailNow(t);
+}
+
+void hg_testing_Fatalf(hg_testing_T *t, hg_string_t fmt, hg_slice_hg_iface_t_t args) {
+    hg_testing_Errorf(t, fmt, args);
+    hg_testing_FailNow(t);
+}
+
+void hg_testing_Skip(hg_testing_T *t, hg_slice_hg_iface_t_t args) {
+    t->skipped = true;
+    hg_testing_Log(t, args);
+    if (t->has_failnow) longjmp(t->failnow_jmp, 2);
+}
+
+void hg_testing_Skipf(hg_testing_T *t, hg_string_t fmt, hg_slice_hg_iface_t_t args) {
+    t->skipped = true;
+    hg_testing_Logf(t, fmt, args);
+    if (t->has_failnow) longjmp(t->failnow_jmp, 2);
+}
+
+typedef void (*hg_test_fn_t)(hg_testing_T*);
+
+bool hg_testing_T_Run(hg_testing_T *parent, hg_string_t name, hg_func_t fn) {
+    hg_testing_T sub = {0};
+    sub.name   = name;
+    sub.parent = parent;
+    sub.has_failnow = true;
+    hg_test_fn_t f = (hg_test_fn_t)fn.fn;
+    int jv = setjmp(sub.failnow_jmp);
+    if (jv == 0) f(&sub);
+    return !sub.failed;
+}
+
+/* testing.M shim — the generated test main calls RunTests directly */
+int hg_testing_M_Run(hg_testing_M *m) { (void)m; return 0; }
