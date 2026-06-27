@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "hagane_rt.h"
 #include <stdarg.h>
 #include <time.h>
