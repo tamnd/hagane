@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -36,6 +37,9 @@ var haganeBin = func() string {
 		panic("MkdirTemp: " + err.Error())
 	}
 	bin := filepath.Join(tmp, "hagane")
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
 	// Build from the parent of cmd/hagane/ (the module root).
 	repoRoot := filepath.Join("..", "..")
 	out, err := exec.Command("go", "build", "-o", bin, "./cmd/hagane").CombinedOutput()
@@ -172,10 +176,12 @@ func runHagane(t *testing.T, dir string) (stdout, stderr string, code int) {
 
 	// Step 1: emit C files.
 	emitOut, emitErr := exec.Command(haganeBin, "emit", "--out-dir", tmp, dir).CombinedOutput()
-	if len(emitOut) > 0 && strings.Contains(string(emitOut), "ERROR") {
-		t.Fatalf("hagane emit failed:\n%s", emitOut)
+	if emitErr != nil {
+		t.Fatalf("hagane emit failed (%v):\n%s", emitErr, emitOut)
 	}
-	_ = emitErr
+	if strings.Contains(string(emitOut), "ERROR") {
+		t.Fatalf("hagane emit reported error:\n%s", emitOut)
+	}
 
 	cFiles, err := filepath.Glob(filepath.Join(tmp, "*.c"))
 	if err != nil || len(cFiles) == 0 {
@@ -185,6 +191,9 @@ func runHagane(t *testing.T, dir string) (stdout, stderr string, code int) {
 	// Step 2: compile with cc.
 	cc := resolveCC()
 	binary := filepath.Join(tmp, "testprog")
+	if runtime.GOOS == "windows" {
+		binary += ".exe"
+	}
 	gccArgs := append([]string{"-O1", "-std=c11", "-o", binary}, cFiles...)
 	gccOut, err := exec.Command(cc, gccArgs...).CombinedOutput()
 	if err != nil {
