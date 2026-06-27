@@ -1,5 +1,5 @@
-#define _GNU_SOURCE
 #include "hagane_rt.h"
+#include <stdarg.h>
 #include <time.h>
 
 /* ── memory ──────────────────────────────────────────────────────────────── */
@@ -306,22 +306,104 @@ void hg_fmt_printf(hg_string_t fmt_str, hg_slice_hg_iface_t_t args) {
     }
 }
 
+/* ── portable grow-as-you-go string buffer ───────────────────────────────── */
+
+typedef struct { char *data; size_t len; size_t cap; } hg_sbuf_t;
+
+static void hg_sbuf_init(hg_sbuf_t *b) {
+    b->data = (char*)malloc(128);
+    b->len  = 0;
+    b->cap  = b->data ? 128 : 0;
+}
+
+static void hg_sbuf_grow(hg_sbuf_t *b, size_t extra) {
+    size_t need = b->len + extra + 1;
+    if (need <= b->cap) return;
+    size_t cap = b->cap ? b->cap * 2 : 128;
+    while (cap < need) cap *= 2;
+    b->data = (char*)realloc(b->data, cap);
+    if (!b->data) { fprintf(stderr, "hagane: out of memory\n"); abort(); }
+    b->cap = cap;
+}
+
+static void hg_sbuf_writec(hg_sbuf_t *b, char c) {
+    hg_sbuf_grow(b, 1);
+    b->data[b->len++] = c;
+}
+
+static void hg_sbuf_writes(hg_sbuf_t *b, const char *s, size_t n) {
+    if (!n) return;
+    hg_sbuf_grow(b, n);
+    memcpy(b->data + b->len, s, n);
+    b->len += n;
+}
+
+static void hg_sbuf_printf(hg_sbuf_t *b, const char *fmt, ...) {
+    char tmp[128];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
+    va_end(ap);
+    if (n <= 0) return;
+    if ((size_t)n < sizeof(tmp)) {
+        hg_sbuf_writes(b, tmp, (size_t)n);
+    } else {
+        hg_sbuf_grow(b, (size_t)n);
+        va_start(ap, fmt);
+        vsnprintf(b->data + b->len, (size_t)n + 1, fmt, ap);
+        va_end(ap);
+        b->len += (size_t)n;
+    }
+}
+
+static void hg_iface_sbuf(hg_sbuf_t *b, hg_iface_t v) {
+    if (!v.itab) { hg_sbuf_writes(b, "<nil>", 5); return; }
+    const hg_iface_tab_t *tab = (const hg_iface_tab_t*)v.itab;
+    switch (tab->type->kind) {
+    case HG_KIND_BOOL:   hg_sbuf_writes(b, *(bool*)v.data ? "true" : "false",
+                                        *(bool*)v.data ? 4 : 5); return;
+    case HG_KIND_INT8:   hg_sbuf_printf(b, "%d",   (int)*(int8_t*)v.data);   return;
+    case HG_KIND_INT16:  hg_sbuf_printf(b, "%d",   (int)*(int16_t*)v.data);  return;
+    case HG_KIND_INT32:  hg_sbuf_printf(b, "%d",   *(int32_t*)v.data);       return;
+    case HG_KIND_INT: case HG_KIND_INT64:
+                         hg_sbuf_printf(b, "%lld",  (long long)*(int64_t*)v.data);  return;
+    case HG_KIND_UINT8:  hg_sbuf_printf(b, "%u",   (unsigned)*(uint8_t*)v.data);    return;
+    case HG_KIND_UINT16: hg_sbuf_printf(b, "%u",   (unsigned)*(uint16_t*)v.data);   return;
+    case HG_KIND_UINT32: hg_sbuf_printf(b, "%u",   *(uint32_t*)v.data);             return;
+    case HG_KIND_UINT: case HG_KIND_UINT64:
+                         hg_sbuf_printf(b, "%llu",  (unsigned long long)*(uint64_t*)v.data); return;
+    case HG_KIND_FLOAT32: hg_sbuf_printf(b, "%g",  (double)*(float*)v.data);        return;
+    case HG_KIND_FLOAT64: hg_sbuf_printf(b, "%g",  *(double*)v.data);               return;
+    case HG_KIND_STRING: {
+        hg_string_t s = *(hg_string_t*)v.data;
+        hg_sbuf_writes(b, s.ptr ? s.ptr : "", s.ptr ? (size_t)s.len : 0);
+        return;
+    }
+    case HG_KIND_UINTPTR: hg_sbuf_printf(b, "%llu", (unsigned long long)*(uintptr_t*)v.data); return;
+    default: {
+        const char *name = tab->type->name ? tab->type->name : "?";
+        hg_sbuf_writes(b, "<", 1);
+        hg_sbuf_writes(b, name, strlen(name));
+        hg_sbuf_writes(b, " Value>", 7);
+        return;
+    }
+    }
+}
+
 /* hg_fmt_sprintf: like hg_fmt_printf but returns the result as hg_string_t */
 hg_string_t hg_fmt_sprintf(hg_string_t fmt_str, hg_slice_hg_iface_t_t args) {
-    char *buf = NULL;
-    size_t buf_len = 0;
-    FILE *out = open_memstream(&buf, &buf_len);
-    if (!out) return HG_ZERO_STRING;
+    hg_sbuf_t b;
+    hg_sbuf_init(&b);
 
     const char *p   = fmt_str.ptr;
     const char *end = p + fmt_str.len;
     int64_t ai = 0;
     while (p < end) {
-        if (*p != '%') { fputc(*p++, out); continue; }
+        if (*p != '%') { hg_sbuf_writec(&b, *p++); continue; }
         const char *spec_start = p;
         p++;
         if (p >= end) break;
-        if (*p == '%') { fputc('%', out); p++; continue; }
+        if (*p == '%') { hg_sbuf_writec(&b, '%'); p++; continue; }
         while (p < end && (*p=='-'||*p=='+'||*p==' '||*p=='#'||*p=='0')) p++;
         while (p < end && *p>='0' && *p<='9') p++;
         if (p < end && *p == '.') { p++; while (p < end && *p>='0' && *p<='9') p++; }
@@ -331,45 +413,43 @@ hg_string_t hg_fmt_sprintf(hg_string_t fmt_str, hg_slice_hg_iface_t_t args) {
         if (spec_len > 62) spec_len = 62;
         memcpy(cfmt, spec_start, spec_len);
         cfmt[spec_len] = '\0';
-        if (ai >= args.len) { fprintf(out, "%%!(MISSING)"); continue; }
+        if (ai >= args.len) { hg_sbuf_writes(&b, "%(MISSING)", 10); continue; }
         hg_iface_t a = args.ptr[ai++];
         const hg_iface_tab_t *tab = a.itab ? (const hg_iface_tab_t*)a.itab : NULL;
         uint8_t kind = tab ? tab->type->kind : 0;
         switch (verb) {
         case 'd': case 'i':
             switch (kind) {
-            case HG_KIND_INT8:  fprintf(out, "%lld", (long long)*(int8_t*)a.data);  break;
-            case HG_KIND_INT16: fprintf(out, "%lld", (long long)*(int16_t*)a.data); break;
-            case HG_KIND_INT32: fprintf(out, "%lld", (long long)*(int32_t*)a.data); break;
+            case HG_KIND_INT8:  hg_sbuf_printf(&b, "%lld", (long long)*(int8_t*)a.data);  break;
+            case HG_KIND_INT16: hg_sbuf_printf(&b, "%lld", (long long)*(int16_t*)a.data); break;
+            case HG_KIND_INT32: hg_sbuf_printf(&b, "%lld", (long long)*(int32_t*)a.data); break;
             case HG_KIND_INT: case HG_KIND_INT64:
-                                fprintf(out, "%lld", (long long)*(int64_t*)a.data); break;
-            case HG_KIND_UINT8:  fprintf(out, "%llu", (unsigned long long)*(uint8_t*)a.data);  break;
-            case HG_KIND_UINT16: fprintf(out, "%llu", (unsigned long long)*(uint16_t*)a.data); break;
-            case HG_KIND_UINT32: fprintf(out, "%llu", (unsigned long long)*(uint32_t*)a.data); break;
+                                hg_sbuf_printf(&b, "%lld", (long long)*(int64_t*)a.data); break;
+            case HG_KIND_UINT8:  hg_sbuf_printf(&b, "%llu", (unsigned long long)*(uint8_t*)a.data);  break;
+            case HG_KIND_UINT16: hg_sbuf_printf(&b, "%llu", (unsigned long long)*(uint16_t*)a.data); break;
+            case HG_KIND_UINT32: hg_sbuf_printf(&b, "%llu", (unsigned long long)*(uint32_t*)a.data); break;
             case HG_KIND_UINT: case HG_KIND_UINT64:
-                                 fprintf(out, "%llu", (unsigned long long)*(uint64_t*)a.data); break;
-            default: hg_iface_fprint(out, a); break;
+                                 hg_sbuf_printf(&b, "%llu", (unsigned long long)*(uint64_t*)a.data); break;
+            default: hg_iface_sbuf(&b, a); break;
             } break;
         case 's':
             if (kind == HG_KIND_STRING) {
                 hg_string_t s = *(hg_string_t*)a.data;
-                fprintf(out, "%.*s", (int)s.len, s.ptr ? s.ptr : "");
-            } else hg_iface_fprint(out, a);
+                hg_sbuf_writes(&b, s.ptr ? s.ptr : "", s.ptr ? (size_t)s.len : 0);
+            } else hg_iface_sbuf(&b, a);
             break;
-        case 'v': hg_iface_fprint(out, a); break;
+        case 'v': hg_iface_sbuf(&b, a); break;
         case 'f': case 'e': case 'E': case 'g': case 'G':
-            if (kind == HG_KIND_FLOAT64) fprintf(out, cfmt, *(double*)a.data);
-            else if (kind == HG_KIND_FLOAT32) fprintf(out, cfmt, (double)*(float*)a.data);
-            else hg_iface_fprint(out, a);
+            if (kind == HG_KIND_FLOAT64) hg_sbuf_printf(&b, cfmt, *(double*)a.data);
+            else if (kind == HG_KIND_FLOAT32) hg_sbuf_printf(&b, cfmt, (double)*(float*)a.data);
+            else hg_iface_sbuf(&b, a);
             break;
-        default: fputc('%', out); fputc(verb, out); break;
+        default: hg_sbuf_writec(&b, '%'); hg_sbuf_writec(&b, verb); break;
         }
     }
-    fclose(out);
 
-    char *result = (char*)hg_alloc(buf_len + 1);
-    memcpy(result, buf, buf_len);
-    result[buf_len] = '\0';
-    free(buf);
-    return (hg_string_t){.ptr = result, .len = (int64_t)buf_len};
+    /* NUL-terminate and return as hg_string_t (transfers ownership of b.data) */
+    hg_sbuf_grow(&b, 1);
+    b.data[b.len] = '\0';
+    return (hg_string_t){.ptr = b.data, .len = (int64_t)b.len};
 }
